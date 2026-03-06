@@ -1,0 +1,2030 @@
+// ==UserScript==
+// @name         Cathay Award Helper
+// @namespace    codex.local
+// @version      0.2.0
+// @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
+// @author       Codex
+// @match        https://www.cathaypacific.com/cx/en_US.html
+// @match        https://*.cathaypacific.com/*
+// @match        https://book.cathaypacific.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+/* eslint-disable */
+
+(function () {
+  "use strict";
+
+  const PANEL_ID = "cx-award-helper-panel";
+  const STYLE_ID = "cx-award-helper-style";
+  const SETTINGS_KEY = "cx-award-helper-settings-v2";
+  const RUN_KEY = "cx-award-helper-run-v2";
+  const WINDOW_NAME_PREFIX = "__cx_award_helper__:";
+  const MAX_DAYS = 14;
+  const DEFAULT_DELAY_MS = 2200;
+  const DEFAULT_SETTINGS = {
+    routePreset: "JFK-HKG",
+    origin: "JFK",
+    destination: "HKG",
+    startDate: "",
+    days: 7,
+    adults: 1,
+    cabinPreset: "PY",
+    cabin: "PY",
+    directOnly: true,
+    delayMs: DEFAULT_DELAY_MS,
+  };
+  const ROUTE_PRESETS = [
+    { value: "JFK-HKG", label: "JFK -> HKG", origin: "JFK", destination: "HKG" },
+    { value: "HKG-JFK", label: "HKG -> JFK", origin: "HKG", destination: "JFK" },
+    { value: "LAX-HKG", label: "LAX -> HKG", origin: "LAX", destination: "HKG" },
+    { value: "HKG-LAX", label: "HKG -> LAX", origin: "HKG", destination: "LAX" },
+    { value: "SFO-HKG", label: "SFO -> HKG", origin: "SFO", destination: "HKG" },
+    { value: "HKG-SFO", label: "HKG -> SFO", origin: "HKG", destination: "SFO" },
+    { value: "", label: "Custom route", origin: "", destination: "" },
+  ];
+  const CABIN_PRESETS = [
+    { value: "Y", label: "Economy", cabin: "Y" },
+    { value: "PY", label: "Premium Economy", cabin: "PY" },
+    { value: "J", label: "Business", cabin: "J" },
+    { value: "F", label: "First", cabin: "F" },
+    { value: "", label: "Keep current cabin", cabin: "" },
+  ];
+  const CABIN_LABELS = {
+    Y: "Economy",
+    PY: "Premium Economy",
+    J: "Business",
+    F: "First",
+  };
+
+  const state = {
+    running: false,
+    stopping: false,
+    status: 'Start from Cathay\'s homepage with "Book with miles" turned on.',
+    results: [],
+  };
+
+  function shouldStop() {
+    if (state.stopping) return true;
+    const run = loadRun();
+    return run && !run.active;
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function loadSettings() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+      return Object.assign({}, DEFAULT_SETTINGS, parsed || {});
+    } catch (_) {
+      return Object.assign({}, DEFAULT_SETTINGS);
+    }
+  }
+
+  function saveSettings(settings) {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }
+
+  function clearSettings() {
+    localStorage.removeItem(SETTINGS_KEY);
+  }
+
+  function loadRun() {
+    try {
+      const raw = String(window.name || "");
+      if (!raw.startsWith(WINDOW_NAME_PREFIX)) {
+        return null;
+      }
+      return JSON.parse(raw.slice(WINDOW_NAME_PREFIX.length) || "null");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveRun(run) {
+    window.name = WINDOW_NAME_PREFIX + JSON.stringify(run);
+  }
+
+  function clearRun() {
+    const raw = String(window.name || "");
+    if (raw.startsWith(WINDOW_NAME_PREFIX)) {
+      window.name = "";
+    }
+  }
+
+  function getField(id) {
+    return document.getElementById(id);
+  }
+
+  function normalizeText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function normalizeAirportCode(text) {
+    const raw = String(text || "").trim().toUpperCase();
+    const parenMatch = raw.match(/\(([A-Z]{3})\)/);
+    if (parenMatch) {
+      return parenMatch[1];
+    }
+    const boundaryMatch = raw.match(/\b([A-Z]{3})\b/);
+    if (boundaryMatch) {
+      return boundaryMatch[1];
+    }
+    const collapsed = raw.replace(/[^A-Z]/g, "");
+    if (!/^[A-Z]{3}$/.test(collapsed)) {
+      throw new Error(`Invalid airport code: ${text}`);
+    }
+    return collapsed;
+  }
+
+  function normalizeDate(text) {
+    const raw = String(text || "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      return raw;
+    }
+    const slashMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (slashMatch) {
+      const month = String(slashMatch[1]).padStart(2, "0");
+      const day = String(slashMatch[2]).padStart(2, "0");
+      return `${slashMatch[3]}-${month}-${day}`;
+    }
+    throw new Error(`Invalid date: ${text}`);
+  }
+
+  function addDays(dateText, daysToAdd) {
+    const date = new Date(`${dateText}T00:00:00`);
+    date.setDate(date.getDate() + daysToAdd);
+    return date.toISOString().slice(0, 10);
+  }
+
+  function formatDisplayDate(dateText) {
+    const date = new Date(`${dateText}T00:00:00`);
+    return date.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+  }
+
+  function formatCathayInputDate(dateText) {
+    const date = new Date(`${dateText}T00:00:00`);
+    return date.toLocaleDateString("en-GB", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  }
+
+  function readFormSettings() {
+    const routePreset = getField("cxah-route-preset").value;
+    const route = ROUTE_PRESETS.find((item) => item.value === routePreset);
+    const cabinPreset = getField("cxah-cabin-preset").value;
+    const cabinChoice = getField("cxah-cabin").value || cabinPreset;
+    return {
+      routePreset,
+      origin: getField("cxah-origin").value.trim() || (route && route.origin) || "",
+      destination: getField("cxah-destination").value.trim() || (route && route.destination) || "",
+      startDate: getField("cxah-start-date").value,
+      days: Math.max(1, Math.min(MAX_DAYS, Number(getField("cxah-days").value) || DEFAULT_SETTINGS.days)),
+      adults: Math.max(1, Math.min(4, Number(getField("cxah-adults").value) || DEFAULT_SETTINGS.adults)),
+      cabinPreset,
+      cabin: cabinChoice,
+      directOnly: Boolean(getField("cxah-direct-only").checked),
+      delayMs: Math.max(1200, Number(getField("cxah-delay").value) || DEFAULT_DELAY_MS),
+    };
+  }
+
+  function fillForm(settings) {
+    getField("cxah-route-preset").value = settings.routePreset || "";
+    getField("cxah-origin").value = settings.origin || "";
+    getField("cxah-destination").value = settings.destination || "";
+    getField("cxah-start-date").value = settings.startDate || "";
+    getField("cxah-days").value = settings.days || DEFAULT_SETTINGS.days;
+    getField("cxah-adults").value = settings.adults || DEFAULT_SETTINGS.adults;
+    getField("cxah-cabin-preset").value = settings.cabinPreset || "";
+    getField("cxah-cabin").value = settings.cabin || "";
+    getField("cxah-direct-only").checked = settings.directOnly !== false;
+    getField("cxah-delay").value = settings.delayMs || DEFAULT_DELAY_MS;
+  }
+
+  function buildOptions(options, selectedValue) {
+    return options
+      .map((option) => {
+        const selected = option.value === selectedValue ? "selected" : "";
+        return `<option value="${option.value}" ${selected}>${option.label}</option>`;
+      })
+      .join("");
+  }
+
+  function applyRoutePreset() {
+    const selected = ROUTE_PRESETS.find((item) => item.value === getField("cxah-route-preset").value);
+    if (!selected) {
+      return;
+    }
+    if (selected.origin) {
+      getField("cxah-origin").value = selected.origin;
+    }
+    if (selected.destination) {
+      getField("cxah-destination").value = selected.destination;
+    }
+  }
+
+  function applyCabinPreset() {
+    const selected = CABIN_PRESETS.find((item) => item.value === getField("cxah-cabin-preset").value);
+    if (!selected) {
+      return;
+    }
+    getField("cxah-cabin").value = selected.cabin;
+  }
+
+  function setStatus(message) {
+    state.status = message;
+    const el = document.querySelector(`#${PANEL_ID} .cxah-status`);
+    if (el) {
+      el.textContent = message;
+    }
+  }
+
+  function findVisibleElements(selector) {
+    return Array.from(document.querySelectorAll(selector)).filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+  }
+
+  function findClickableByText(regex) {
+    return findVisibleElements("button, a, div, span, label").find((el) => {
+      const text = normalizeText(el.innerText);
+      if (!regex.test(text)) {
+        return false;
+      }
+      const clickable = el.closest("button, a, label, [role='button'], [tabindex]");
+      return Boolean(clickable || el.tagName === "BUTTON" || el.tagName === "A");
+    });
+  }
+
+  function clickElement(el) {
+    const target = el.closest("button, a, label, [role='button'], [tabindex]") || el;
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  }
+
+  function isHomepage() {
+    const text = document.body ? document.body.innerText : "";
+    return /Book a trip/.test(text) && /(Redeem flights|Search flights)/.test(text);
+  }
+
+  function isResultsPage() {
+    const text = document.body ? document.body.innerText : "";
+    return /Select flights/.test(text) || /Lowest miles shown on the calendar/.test(text);
+  }
+
+  function hasMilesToggleEnabled() {
+    const text = document.body ? document.body.innerText : "";
+    return /Redeem flights/.test(text);
+  }
+
+  function findHomepageSearchButton() {
+    return findVisibleElements("button, a, div").find((el) => {
+      const text = normalizeText(el.innerText);
+      return /^(Redeem flights|Search flights)$/.test(text);
+    });
+  }
+
+  function findNewSearchLink() {
+    return findClickableByText(/^New search$/i);
+  }
+
+  function findCheckboxByLabelText(labelRegex) {
+    const labels = findVisibleElements("label, div, span");
+    const hit = labels.find((el) => labelRegex.test(normalizeText(el.innerText)));
+    if (!hit) {
+      return null;
+    }
+    const label = hit.closest("label") || hit;
+    const forId = label.getAttribute && label.getAttribute("for");
+    if (forId) {
+      return document.getElementById(forId);
+    }
+    return label.querySelector("input[type='checkbox']") || label.previousElementSibling || label.nextElementSibling;
+  }
+
+  async function ensureDirectFlightsEnabled() {
+    // Try finding the checkbox by label
+    const checkbox = findCheckboxByLabelText(/^Direct flights$/i);
+    if (checkbox) {
+      if (checkbox.checked === true) {
+        console.log("[CX Helper] Direct flights already checked");
+        return;
+      }
+      console.log("[CX Helper] Clicking Direct flights checkbox");
+      forceToggle(checkbox);
+      await sleep(1500);
+      return;
+    }
+    // Fallback: find the "Direct flights" text and click near it
+    const label = findClickableByText(/^Direct flights$/i);
+    if (label) {
+      console.log("[CX Helper] Clicking Direct flights label");
+      forceClick(label);
+      await sleep(1500);
+    } else {
+      console.log("[CX Helper] Direct flights checkbox/label not found");
+    }
+  }
+
+  /**
+   * Try multiple click strategies on an element.
+   * Cathay uses a JS framework that may not respond to synthetic MouseEvents.
+   */
+  function forceClick(el) {
+    const rect = el.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+    // Strategy 1: full pointer event sequence (what modern frameworks expect)
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerId: 1 }));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerId: 1 }));
+    // Strategy 2: mouse events
+    el.dispatchEvent(new MouseEvent("mousedown", opts));
+    el.dispatchEvent(new MouseEvent("mouseup", opts));
+    el.dispatchEvent(new MouseEvent("click", opts));
+    // Strategy 3: native .click()
+    el.click();
+  }
+
+  /** Like forceClick but also handles checkbox/radio inputs */
+  function forceToggle(el) {
+    forceClick(el);
+    if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
+      el.checked = !el.checked;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  async function ensureMilesToggleOn() {
+    // Wait for homepage booking panel to fully render
+    for (let waitRound = 0; waitRound < 12; waitRound++) {
+      await sleep(1500);
+      if (hasMilesToggleEnabled()) {
+        console.log("[CX Helper] Book with miles already enabled");
+        return true;
+      }
+      const bodyText = document.body ? document.body.innerText : "";
+      if (/Book with miles/.test(bodyText) || /Search flights/.test(bodyText)) {
+        console.log("[CX Helper] Booking panel detected on attempt", waitRound);
+        break;
+      }
+      console.log("[CX Helper] Waiting for booking panel... attempt", waitRound);
+    }
+
+    if (hasMilesToggleEnabled()) return true;
+    console.log("[CX Helper] Book with miles NOT enabled, attempting toggle...");
+
+    // SAFE Strategy 1: Find role="switch" near "Book with miles" text
+    const switches = findVisibleElements('[role="switch"], [role="checkbox"]');
+    for (const sw of switches) {
+      const parent = sw.closest("[class]") || sw.parentElement;
+      const nearby = parent ? normalizeText(parent.innerText) : "";
+      if (/book with miles/i.test(nearby)) {
+        console.log("[CX Helper] Found role=switch near toggle:",
+          sw.tagName, sw.getAttribute("aria-checked"));
+        forceClick(sw);
+        await sleep(1500);
+        if (hasMilesToggleEnabled()) {
+          console.log("[CX Helper] Book with miles ENABLED via role=switch!");
+          return true;
+        }
+      }
+    }
+
+    // SAFE Strategy 2: Find input[type=checkbox] inside a label with "Book with miles"
+    const checkboxes = findVisibleElements('input[type="checkbox"]');
+    for (const cb of checkboxes) {
+      const label = cb.closest("label");
+      if (label && /book with miles/i.test(normalizeText(label.innerText))) {
+        console.log("[CX Helper] Found checkbox in 'Book with miles' label");
+        forceToggle(cb);
+        await sleep(1500);
+        if (hasMilesToggleEnabled()) {
+          console.log("[CX Helper] Book with miles ENABLED via checkbox!");
+          return true;
+        }
+      }
+    }
+
+    // SAFE Strategy 3: Find the smallest element with exact text "Book with miles"
+    // and click ONLY that element (not parents - that risks clicking other UI elements)
+    const allEls = findVisibleElements("span, div, label, p");
+    const label = allEls.find((el) => normalizeText(el.innerText) === "Book with miles");
+    if (label) {
+      console.log("[CX Helper] Clicking 'Book with miles' text element:",
+        label.tagName, String(label.className || "").slice(0, 60));
+      forceClick(label);
+      await sleep(1500);
+      if (hasMilesToggleEnabled()) {
+        console.log("[CX Helper] Book with miles ENABLED via label click!");
+        return true;
+      }
+    }
+
+    // Could not toggle it - proceed anyway so we don't block date setting.
+    // The search will use cash fares, but at least the flow continues.
+    console.log("[CX Helper] WARNING: Could not enable Book with miles. Proceeding anyway.");
+    return true;
+  }
+
+  function findCabinTile(cabinCode) {
+    const label = CABIN_LABELS[cabinCode];
+    if (!label) {
+      return null;
+    }
+    return findVisibleElements("button, div, a").find((el) => {
+      const text = normalizeText(el.innerText);
+      if (!text) {
+        return false;
+      }
+      if (!text.includes(label)) {
+        return false;
+      }
+      if (/View full details/i.test(text)) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 120 && rect.height > 80;
+    });
+  }
+
+  /** Check if the desired cabin is already displayed on the results page */
+  function isCabinAlreadyShowing(cabinCode) {
+    const label = CABIN_LABELS[cabinCode];
+    if (!label) return false;
+    // Look for the cabin label prominently displayed (the dark tile header)
+    const bodyText = document.body ? document.body.innerText : "";
+    // The cabin tile shows e.g. "Premium Economy\nFROM A75,000" at the top of results
+    return new RegExp(label, "i").test(bodyText);
+  }
+
+  async function selectCabinOnResults(cabinCode) {
+    if (!cabinCode) {
+      return true;
+    }
+
+    // If the cabin is already showing on the page, don't click anything.
+    // The results page displays the cabin from the homepage search.
+    // Clicking the cabin tile again can disrupt the page.
+    if (isCabinAlreadyShowing(cabinCode)) {
+      console.log("[CX Helper] Cabin", cabinCode, "already showing on results page, skipping click");
+      return true;
+    }
+
+    // Cabin not showing - try to find and click the tile to switch
+    const tile = findCabinTile(cabinCode);
+    if (!tile) {
+      // Check if any flight cards are visible anyway
+      const hasFlightCards = findVisibleElements("div, article, section").some((el) => {
+        const text = normalizeText(el.innerText);
+        return /Flight details/i.test(text) && /\b(CX|KA|[A-Z]{2})\d{2,4}\b/.test(text);
+      });
+      console.log("[CX Helper] Cabin tile not found for", cabinCode,
+        "- flight cards visible:", hasFlightCards);
+      return hasFlightCards;
+    }
+    console.log("[CX Helper] Clicking cabin tile for", cabinCode);
+    clickElement(tile);
+    await sleep(1400);
+    return true;
+  }
+
+  function getVisibleCalendarCells() {
+    const dayNumbers = new Set(["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31"]);
+    return findVisibleElements("button, a, div").filter((el) => {
+      const text = normalizeText(el.innerText);
+      if (!text || text.length > 60) {
+        return false;
+      }
+      const lines = text.split(/\s+/);
+      return lines.some((part) => dayNumbers.has(part.padStart(2, "0"))) && (/\bNot available\b/i.test(text) || /A\d|HKD|\$\d/.test(text) || /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(text));
+    });
+  }
+
+  function findCalendarCellForDay(dayNumber) {
+    const twoDigit = String(dayNumber).padStart(2, "0");
+    const cells = getVisibleCalendarCells();
+    return cells.find((el) => {
+      const text = normalizeText(el.innerText);
+      return new RegExp(`\\b${Number(twoDigit)}\\b|\\b${twoDigit}\\b`).test(text);
+    });
+  }
+
+  function findCalendarNextArrow() {
+    return findVisibleElements("button, a, div, span").find((el) => {
+      const text = normalizeText(el.innerText);
+      if (/^>$|^›$|^→$/.test(text)) {
+        return true;
+      }
+      const aria = String(el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title")) || "");
+      return /next/i.test(aria);
+    });
+  }
+
+  function findCalendarPrevArrow() {
+    return findVisibleElements("button, a, div, span").find((el) => {
+      const text = normalizeText(el.innerText);
+      if (/^<$|^‹$|^←$/.test(text)) {
+        return true;
+      }
+      const aria = String(el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title")) || "");
+      return /prev|previous/i.test(aria);
+    });
+  }
+
+  function parseHumanDate(text) {
+    const match = String(text || "").match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
+    if (!match) {
+      return "";
+    }
+    const monthNames = {
+      Jan: "01",
+      Feb: "02",
+      Mar: "03",
+      Apr: "04",
+      May: "05",
+      Jun: "06",
+      Jul: "07",
+      Aug: "08",
+      Sep: "09",
+      Oct: "10",
+      Nov: "11",
+      Dec: "12",
+    };
+    const month = monthNames[match[2]];
+    if (!month) {
+      return "";
+    }
+    return `${match[3]}-${month}-${String(match[1]).padStart(2, "0")}`;
+  }
+
+  function getCurrentResultsDate() {
+    const blocks = findVisibleElements("div, span, p, h1, h2, h3");
+    for (const el of blocks) {
+      const text = normalizeText(el.innerText);
+      // Pattern 1: "Departing 30 Nov 2026" all in one element
+      if (/^Departing\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/i.test(text)) {
+        return parseHumanDate(text);
+      }
+      // Pattern 2: "Departing" label with date in parent/sibling
+      if (/^Departing$/i.test(text)) {
+        // Check parent
+        const parentText = normalizeText((el.parentElement && el.parentElement.innerText) || "");
+        const parsed = parseHumanDate(parentText);
+        if (parsed) return parsed;
+        // Check next sibling
+        const nextSib = el.nextElementSibling;
+        if (nextSib) {
+          const sibText = normalizeText(nextSib.innerText);
+          const sibParsed = parseHumanDate(sibText);
+          if (sibParsed) return sibParsed;
+        }
+      }
+    }
+    // Pattern 3: Look for any standalone date like "30 Nov 2026" near the top of the page
+    for (const el of blocks) {
+      const rect = el.getBoundingClientRect();
+      if (rect.top > 200) continue; // Only check top area
+      const text = normalizeText(el.innerText);
+      if (/^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(text)) {
+        return parseHumanDate(text);
+      }
+    }
+    return "";
+  }
+
+  function getHomepageDepartingDate() {
+    const blocks = findVisibleElements("div, span, p");
+    for (const el of blocks) {
+      const text = normalizeText(el.innerText);
+      if (/^Departing on\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/i.test(text)) {
+        return parseHumanDate(text);
+      }
+      if (/^Departing on$/i.test(text)) {
+        const parentText = normalizeText((el.parentElement && el.parentElement.innerText) || "");
+        const parsed = parseHumanDate(parentText);
+        if (parsed) {
+          return parsed;
+        }
+      }
+    }
+    return "";
+  }
+
+  function findHomepageDateField() {
+    const exactButton = findVisibleElements("button").find((el) => {
+      return /\bc-date-picker__range-base\b/.test(el.className || "") && /Departing on/i.test(normalizeText(el.innerText));
+    });
+    if (exactButton) {
+      return exactButton;
+    }
+    const candidates = findVisibleElements("div, button, label, section").filter((el) => {
+      const text = normalizeText(el.innerText);
+      return (
+        /Departing on/i.test(text) &&
+        (/Select a departure date/i.test(text) || /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(text) || /\d{1,2}\s+[A-Za-z]{3}\s+\d{4}/.test(text))
+      );
+    });
+    if (!candidates.length) {
+      return null;
+    }
+    candidates.sort((a, b) => {
+      const rectA = a.getBoundingClientRect();
+      const rectB = b.getBoundingClientRect();
+      return rectB.width * rectB.height - rectA.width * rectA.height;
+    });
+    return candidates[0];
+  }
+
+  function findHomepageStartDateInput() {
+    return findVisibleElements("input").find((el) => {
+      const aria = String(el.getAttribute("aria-label") || "");
+      const placeholder = String(el.getAttribute("placeholder") || "");
+      return /Start Date/i.test(aria) || /departure date/i.test(placeholder);
+    });
+  }
+
+  async function trySetHomepageDateViaInput(targetDate) {
+    const input = findHomepageStartDateInput();
+    if (!input) {
+      return false;
+    }
+    const value = formatCathayInputDate(targetDate);
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    await sleep(500);
+    return getHomepageDepartingDate() === targetDate || normalizeText(input.value) === value;
+  }
+
+  function findLeavePageButton() {
+    return findClickableByText(/^Leave page$/i);
+  }
+
+  async function confirmLeavePageIfPresent() {
+    const leaveButton = findLeavePageButton();
+    if (!leaveButton) {
+      return false;
+    }
+    clickElement(leaveButton);
+    await sleep(900);
+    return true;
+  }
+
+  function formatMonthLabel(dateText) {
+    const date = new Date(`${dateText}T00:00:00`);
+    return date.toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+    });
+  }
+
+  /**
+   * Get visible month header texts from the two-month calendar popup.
+   * Returns an array like ["March 2026", "April 2026"].
+   */
+  function getVisibleCalendarMonthHeaders() {
+    return findVisibleElements("div, span, h2, h3, caption")
+      .map((el) => normalizeText(el.innerText))
+      .filter((text) => /^[A-Z][a-z]+ \d{4}$/.test(text));
+  }
+
+  /**
+   * Find the next-month arrow button in the calendar.
+   * From the screenshot: it's a ">" character on the right side of the calendar header row,
+   * next to the second month name (e.g. "April 2026  >").
+   */
+  function findCalendarNextButton() {
+    const candidates = findVisibleElements("button, a, span, div, i");
+
+    // Strategy 1: aria-label with "next"
+    for (const el of candidates) {
+      const aria = String(el.getAttribute("aria-label") || el.getAttribute("title") || "");
+      if (/next/i.test(aria) && !/previous/i.test(aria)) {
+        console.log("[CX Helper] Next button found via aria-label:", el.tagName, el.className, aria);
+        return el;
+      }
+    }
+
+    // Strategy 2: exact text ">" or similar chevron characters
+    for (const el of candidates) {
+      const text = normalizeText(el.innerText);
+      if (/^[>›→❯⟩]$/.test(text)) {
+        console.log("[CX Helper] Next button found via text '>':", el.tagName, el.className);
+        return el;
+      }
+    }
+
+    // Strategy 3: Small clickable element near the right edge of a month header area
+    // Find the rightmost month header, then look for a clickable sibling nearby
+    const monthHeaders = findVisibleElements("div, span, h2, h3, caption").filter((el) => {
+      return /^[A-Z][a-z]+ \d{4}$/.test(normalizeText(el.innerText));
+    });
+    if (monthHeaders.length > 0) {
+      // Get the rightmost month header
+      const rightHeader = monthHeaders.reduce((a, b) =>
+        a.getBoundingClientRect().right > b.getBoundingClientRect().right ? a : b
+      );
+      const headerRect = rightHeader.getBoundingClientRect();
+
+      // Look for a small clickable element to the right of this header
+      for (const el of candidates) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.width > 60 || rect.height > 60) continue;
+        // Must be to the right of the month header and roughly at the same vertical position
+        if (rect.left > headerRect.right - 10 &&
+            Math.abs(rect.top - headerRect.top) < 30) {
+          // Check it has an SVG, icon, or the chevron character
+          const hasIcon = el.querySelector("svg, i, [class*='icon'], [class*='arrow'], [class*='chevron']");
+          const text = normalizeText(el.innerText);
+          if (hasIcon || /^[>›→❯⟩]$/.test(text) || text === "") {
+            console.log("[CX Helper] Next button found via position:", el.tagName, el.className, "text:", JSON.stringify(text));
+            return el;
+          }
+        }
+      }
+
+      // Strategy 4: Check the parent/ancestor of the month header for a next button
+      let headerParent = rightHeader.parentElement;
+      for (let depth = 0; depth < 4 && headerParent; depth++) {
+        const btns = Array.from(headerParent.querySelectorAll("button, a, [role='button']")).filter((el) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && rect.width < 60;
+        });
+        // Take the rightmost small button in the header area
+        if (btns.length > 0) {
+          const rightBtn = btns.reduce((a, b) =>
+            a.getBoundingClientRect().left > b.getBoundingClientRect().left ? a : b
+          );
+          console.log("[CX Helper] Next button found via header ancestor:", rightBtn.tagName, rightBtn.className, "text:", JSON.stringify(normalizeText(rightBtn.innerText)));
+          return rightBtn;
+        }
+        headerParent = headerParent.parentElement;
+      }
+    }
+
+    console.log("[CX Helper] Could not find next button at all");
+    return null;
+  }
+
+  /**
+   * Find a month panel within the two-month calendar view by its header text.
+   * The calendar shows two months side by side. Each month has a header like
+   * "March 2026" and a grid of day cells below it.
+   */
+  function findMonthPanel(monthLabel) {
+    // Find all visible elements whose text is exactly the month label
+    const headers = findVisibleElements("div, span, h2, h3, caption").filter((el) => {
+      return normalizeText(el.innerText) === monthLabel;
+    });
+
+    for (const header of headers) {
+      // Walk up from the header to find the container with both header and day grid
+      let container = header.parentElement;
+      for (let depth = 0; depth < 8 && container; depth++) {
+        // Check if this container has day cells (td elements with numbers)
+        const hasDayCells = container.querySelector("td, [class*='calendar__cell'], [class*='dayPicker']");
+        if (hasDayCells) {
+          // Make sure this container's text includes the month label (not a parent of both months)
+          const containerText = normalizeText(container.innerText);
+          // Avoid selecting the entire two-month wrapper (it would contain both month labels)
+          const allMonths = getVisibleCalendarMonthHeaders();
+          const containsMultipleMonths = allMonths.filter((m) => containerText.includes(m)).length > 1;
+          if (!containsMultipleMonths) {
+            return container;
+          }
+        }
+        container = container.parentElement;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find a clickable day cell within a month panel.
+   * The day number appears as text like "1", "15", "31" inside td or button elements.
+   * Excludes disabled/other-month cells to avoid clicking day "1" in the wrong month.
+   */
+  function findDayCell(dayNumber, scopeEl) {
+    const exact = String(Number(dayNumber));
+    const root = scopeEl || document;
+
+    // Look for td cells or specific calendar cell elements containing the exact day number
+    const candidates = Array.from(root.querySelectorAll("td, button, div, span")).filter((el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      // Day cells are typically smallish (a single grid cell)
+      if (rect.width > 100 || rect.height > 100) return false;
+      const text = normalizeText(el.innerText);
+      // Match exact day number - the cell text might be just "6" or might include
+      // a small icon/indicator, so check if the text starts with or equals the day
+      if (text !== exact && !text.startsWith(exact + " ")) return false;
+
+      // Exclude disabled / other-month cells
+      const cl = String(el.className || "");
+      const parentCl = String((el.parentElement && el.parentElement.className) || "");
+      const allCl = cl + " " + parentCl;
+      if (/disabled|outside|other-month|inactive|prev-month|next-month|muted|faded/i.test(allCl)) return false;
+      // Also check aria-disabled
+      if (el.getAttribute("aria-disabled") === "true") return false;
+      // Check opacity - other-month days are often dimmed
+      const style = window.getComputedStyle(el);
+      if (parseFloat(style.opacity) < 0.5) return false;
+
+      return true;
+    });
+
+    if (candidates.length === 0) return null;
+
+    // Prefer the most specific (smallest/innermost) element
+    candidates.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) - (rb.width * rb.height);
+    });
+
+    console.log("[CX Helper] findDayCell found", candidates.length, "candidates for day", exact,
+      "picking:", candidates[0].tagName, candidates[0].className, "text:", normalizeText(candidates[0].innerText));
+    return candidates[0];
+  }
+
+  /**
+   * Navigate the two-month calendar to show the target month, then click the target day.
+   * The calendar shows two months at a time with a ">" arrow to go forward.
+   */
+  async function setHomepageDepartingDate(targetDate) {
+    const currentDate = getHomepageDepartingDate();
+    if (currentDate === targetDate) {
+      return true;
+    }
+
+    // Click the date field to open the calendar popup
+    const dateField = findHomepageDateField();
+    if (!dateField) {
+      console.log("[CX Helper] Could not find homepage date field");
+      return false;
+    }
+    clickElement(dateField);
+    await sleep(1200);
+
+    // Wait for calendar month headers to appear
+    let headers = [];
+    for (let wait = 0; wait < 10; wait++) {
+      headers = getVisibleCalendarMonthHeaders();
+      if (headers.length > 0) break;
+      await sleep(500);
+    }
+    if (headers.length === 0) {
+      console.log("[CX Helper] No calendar month headers appeared after clicking date field");
+      return false;
+    }
+    console.log("[CX Helper] Calendar opened, visible months:", headers);
+
+    const targetMonthLabel = formatMonthLabel(targetDate);
+    const targetDay = targetDate.slice(8, 10);
+
+    // Navigate forward until the target month is visible (max ~12 clicks for a year out)
+    for (let clicks = 0; clicks < 18; clicks++) {
+      const visibleMonths = getVisibleCalendarMonthHeaders();
+      console.log("[CX Helper] Visible months:", visibleMonths, "Looking for:", targetMonthLabel);
+
+      if (visibleMonths.includes(targetMonthLabel)) {
+        // Target month is visible! Find its panel and click the day.
+        await sleep(300);
+        const monthPanel = findMonthPanel(targetMonthLabel);
+        if (!monthPanel) {
+          // If we can't isolate the panel, try finding the day cell in the whole document
+          console.log("[CX Helper] Could not isolate month panel, trying document-wide search");
+          const dayCell = findDayCell(targetDay, document);
+          if (dayCell) {
+            clickElement(dayCell);
+            await sleep(800);
+            const result = getHomepageDepartingDate();
+            console.log("[CX Helper] After clicking day (doc-wide), date field shows:", result);
+            return result === targetDate;
+          }
+          return false;
+        }
+
+        const dayCell = findDayCell(targetDay, monthPanel);
+        if (!dayCell) {
+          console.log("[CX Helper] Found month panel but could not find day", targetDay);
+          console.log("[CX Helper] Panel text:", normalizeText(monthPanel.innerText).slice(0, 300));
+          return false;
+        }
+
+        console.log("[CX Helper] Clicking day cell for", targetMonthLabel, "day", targetDay);
+        clickElement(dayCell);
+        await sleep(1000);
+
+        // Check if date was set. For one-way trips, a single click should suffice.
+        let result = getHomepageDepartingDate();
+        console.log("[CX Helper] After day click, date field reads:", result, "expected:", targetDate);
+
+        // If the wrong date was set (e.g. clicked Nov 30 instead of Dec 1), detect and retry
+        if (result && result !== targetDate) {
+          console.log("[CX Helper] Wrong date set! Got", result, "instead of", targetDate, "- will retry");
+          // Re-open the calendar and try again
+          clickElement(dateField);
+          await sleep(1000);
+          // Navigate to the right month again (it might have reset)
+          continue;
+        }
+
+        if (result === targetDate) {
+          console.log("[CX Helper] Date successfully set to", targetDate);
+          return true;
+        }
+
+        // The calendar might still be open expecting a return date click.
+        // Since this is one-way, look for a "Done" / "Confirm" button.
+        const confirmBtn = findVisibleElements("button").find((el) => {
+          const text = normalizeText(el.innerText);
+          return /^(Done|Confirm|Apply|OK|Select)$/i.test(text);
+        });
+        if (confirmBtn) {
+          clickElement(confirmBtn);
+          await sleep(600);
+          result = getHomepageDepartingDate();
+          if (result === targetDate) return true;
+        }
+
+        // If still not set, the field text might not update until calendar closes.
+        // Try clicking outside the calendar to close it.
+        const bookingPanel = findVisibleElements("div").find((el) =>
+          /Book a trip/i.test(normalizeText(el.innerText)) && el.getBoundingClientRect().width > 400
+        );
+        if (bookingPanel) {
+          bookingPanel.click();
+          await sleep(600);
+          result = getHomepageDepartingDate();
+          if (result === targetDate) return true;
+        }
+
+        console.log("[CX Helper] Clicked day but date field shows:", result, "expected:", targetDate);
+        // Accept if any date was set (field changed from "Select a departure date")
+        return result !== "" && result === targetDate;
+      }
+
+      // Target month not visible yet - click the next arrow
+      const beforeMonths = visibleMonths.join(", ");
+      const nextBtn = findCalendarNextButton();
+      if (!nextBtn) {
+        console.log("[CX Helper] Could not find calendar next arrow to navigate forward");
+        return false;
+      }
+      // Log details about what we're clicking
+      const btnRect = nextBtn.getBoundingClientRect();
+      console.log("[CX Helper] Clicking next button:", nextBtn.tagName, nextBtn.className,
+        "outerHTML:", nextBtn.outerHTML.slice(0, 200),
+        "rect:", Math.round(btnRect.left), Math.round(btnRect.top), Math.round(btnRect.width), "x", Math.round(btnRect.height));
+      clickElement(nextBtn);
+      await sleep(800);
+      const afterMonths = getVisibleCalendarMonthHeaders().join(", ");
+      if (afterMonths === beforeMonths) {
+        console.log("[CX Helper] WARNING: Months did not change after clicking next! Before:", beforeMonths, "After:", afterMonths);
+        // Try clicking the element directly with .click()
+        nextBtn.click();
+        await sleep(800);
+        const afterRetry = getVisibleCalendarMonthHeaders().join(", ");
+        if (afterRetry === beforeMonths) {
+          console.log("[CX Helper] Still no change after direct .click(). Aborting.");
+          return false;
+        }
+      }
+    }
+
+    console.log("[CX Helper] Exhausted navigation attempts, target month not reached");
+    return false;
+  }
+
+  async function ensureCalendarCellVisible(targetDate, currentDate) {
+    const targetDay = Number(targetDate.slice(8, 10));
+    for (let tries = 0; tries < 6; tries += 1) {
+      const cell = findCalendarCellForDay(targetDay);
+      if (cell) {
+        return cell;
+      }
+      let arrow = null;
+      if (currentDate) {
+        arrow = targetDate < currentDate ? findCalendarPrevArrow() : findCalendarNextArrow();
+      } else {
+        arrow = findCalendarNextArrow();
+      }
+      if (!arrow) {
+        return null;
+      }
+      clickElement(arrow);
+      await sleep(1200);
+      currentDate = getCurrentResultsDate() || currentDate;
+    }
+    return null;
+  }
+
+  /**
+   * Parse flight cards from the results page using TWO strategies:
+   * Strategy A: DOM-based - find individual card elements
+   * Strategy B: Text-based - parse the full page text for flight patterns
+   * Returns whichever strategy finds more results.
+   */
+  function parseVisibleItineraries() {
+    const hitsA = parseFlightsFromDOM();
+    const hitsB = parseFlightsFromPageText();
+    console.log("[CX Helper] DOM strategy found:", hitsA.length, "flights. Text strategy found:", hitsB.length, "flights");
+    return hitsA.length >= hitsB.length ? hitsA : hitsB;
+  }
+
+  /** Strategy A: Find flight cards in the DOM */
+  function parseFlightsFromDOM() {
+    const allDivs = findVisibleElements("div, article, section, li");
+    const flightRelated = allDivs.filter((el) => {
+      const text = normalizeText(el.innerText);
+      return text.length > 15 && text.length < 1500 && /\bCX\d{2,4}\b/.test(text);
+    });
+    console.log("[CX Helper] DOM: Elements with CX numbers:", flightRelated.length);
+    for (let i = 0; i < Math.min(3, flightRelated.length); i++) {
+      const t = normalizeText(flightRelated[i].innerText);
+      const r = flightRelated[i].getBoundingClientRect();
+      console.log("[CX Helper] DOM Card", i, "size:", Math.round(r.width) + "x" + Math.round(r.height),
+        "text:", JSON.stringify(t.slice(0, 300)));
+    }
+
+    const hits = [];
+    const seen = new Set();
+    const candidates = flightRelated.slice().sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) - (rb.width * rb.height);
+    });
+
+    for (const el of candidates) {
+      const text = normalizeText(el.innerText);
+      const flightNumbers = text.match(/\bCX\d{2,4}\b/g) || [];
+      const uniqueFlights = [...new Set(flightNumbers)];
+      if (uniqueFlights.length !== 1) continue;
+      const flight = uniqueFlights[0];
+      if (seen.has(flight)) continue;
+      const times = text.match(/\d{1,2}:\d{2}/g) || [];
+      if (times.length === 0) continue;
+      const stopMatch = text.match(/(\d+)\s+stop/i);
+      if (stopMatch && Number(stopMatch[1]) > 0) continue;
+      seen.add(flight);
+      hits.push(extractFlightDetails(flight, text));
+    }
+    return hits;
+  }
+
+  /** Strategy B: Parse the entire page text for flight patterns */
+  function parseFlightsFromPageText() {
+    const bodyText = document.body ? document.body.innerText : "";
+    console.log("[CX Helper] Text: Full page text length:", bodyText.length);
+
+    // Find all CX flight numbers in the page
+    const cxPattern = /\bCX\d{2,4}\b/g;
+    const allCX = [];
+    let m;
+    while ((m = cxPattern.exec(bodyText)) !== null) {
+      allCX.push({ flight: m[0], index: m.index });
+    }
+    console.log("[CX Helper] Text: Found CX numbers:", allCX.map((c) => c.flight));
+
+    const hits = [];
+    const seen = new Set();
+    for (const cx of allCX) {
+      if (seen.has(cx.flight)) continue;
+      // Extract a window of text around this flight number (500 chars after)
+      const window = bodyText.slice(Math.max(0, cx.index - 100), cx.index + 500);
+      const windowNorm = normalizeText(window);
+
+      // Check if this is a connecting flight (has "stop" nearby)
+      if (/\d+\s+stop/i.test(windowNorm)) continue;
+
+      // Must have time patterns nearby
+      const times = windowNorm.match(/\d{1,2}:\d{2}/g) || [];
+      if (times.length === 0) continue;
+
+      seen.add(cx.flight);
+      console.log("[CX Helper] Text: Extracting", cx.flight, "from:", JSON.stringify(windowNorm.slice(0, 200)));
+      hits.push(extractFlightDetails(cx.flight, windowNorm));
+    }
+    return hits;
+  }
+
+  /** Extract departure, arrival, duration, miles from a text block */
+  function extractFlightDetails(flight, text) {
+    const times = text.match(/\d{1,2}:\d{2}/g) || [];
+    const depart = times[0] || "";
+    const arrive = times[1] || "";
+    const arriveNextDay = /\d{1,2}:\d{2}\s*\+\s*\d/.test(text);
+    const arriveDisplay = arrive + (arriveNextDay ? "+1" : "");
+    const durationMatch = text.match(/(\d{1,2}h\s*\d{1,2}m)/);
+    const duration = durationMatch ? durationMatch[1] : "";
+    const milesMatch = text.match(/(\d{2,3}[,.]?\d{3})/g);
+    let miles = "";
+    if (milesMatch) {
+      // Filter out likely non-miles numbers (like times that matched as numbers)
+      const mileCandidates = milesMatch.filter((m) => {
+        const num = Number(m.replace(/[,.]/g, ""));
+        return num >= 10000 && num <= 999000;
+      });
+      if (mileCandidates.length > 0) {
+        miles = mileCandidates[mileCandidates.length - 1].replace(/[,.]/g, "");
+      }
+    }
+    console.log("[CX Helper] Parsed:", flight, depart, "→", arriveDisplay, duration, miles ? miles + " miles" : "");
+    return {
+      flight,
+      depart,
+      arrive: arriveDisplay,
+      duration,
+      miles: miles ? Number(miles).toLocaleString() : "",
+    };
+  }
+
+  function hasExplicitNoFlightsMessage() {
+    const text = document.body ? document.body.innerText : "";
+    if (/No flights available/i.test(text) ||
+      /no available flights/i.test(text) ||
+      /no results found/i.test(text) ||
+      /Sorry, there are no/i.test(text)) return true;
+    return false;
+  }
+
+  /** Check if the currently selected strip cell says "Not available" */
+  function isSelectedDateNotAvailable() {
+    const cells = getVisibleCalendarCells();
+    for (const cell of cells) {
+      const text = normalizeText(cell.innerText);
+      // Check if this cell is the selected one (dark background)
+      const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
+      const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
+      const bg = window.getComputedStyle(cell).backgroundColor;
+      const isSelected = aria === "true" ||
+        /selected|active|current|highlight/i.test(cls) ||
+        (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
+      if (isSelected && /not available/i.test(text)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Wait for flight cards to appear on the results page.
+   * Returns true if cards appeared, false if timed out.
+   */
+  function isPageLoading() {
+    // Check for specific loading indicators (not too broad)
+    const spinners = document.querySelectorAll(
+      '[role="progressbar"], [aria-busy="true"]'
+    );
+    for (const s of spinners) {
+      const rect = s.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return true;
+    }
+    // Check for "Loading" text in the main content area
+    const bodyText = document.body ? document.body.innerText : "";
+    if (/Loading flights/i.test(bodyText) || /Searching for flights/i.test(bodyText)) return true;
+    return false;
+  }
+
+  async function waitForFlightCards(maxWaitMs) {
+    const totalWait = maxWaitMs || 15000;
+    // Wait at least 3 seconds before even checking - give the page time to render
+    const minWaitMs = Math.min(3000, totalWait);
+    console.log("[CX Helper] waitForFlightCards: waiting", minWaitMs, "ms minimum, up to", totalWait, "ms total");
+    await sleep(minWaitMs);
+
+    const deadline = Date.now() + (totalWait - minWaitMs);
+    let foundOnce = false;
+    while (Date.now() < deadline) {
+      // Check if any CX flight numbers with times are visible
+      // Use full body text as primary check (more reliable than individual element scanning)
+      const bodyText = document.body ? document.body.innerText : "";
+      const hasFlights = /\bCX\d{2,4}\b/.test(bodyText) && /\d{1,2}:\d{2}/.test(bodyText) &&
+        /Flight details/i.test(bodyText);
+
+      if (hasFlights) {
+        if (!foundOnce) {
+          console.log("[CX Helper] Flight cards appearing, waiting 2s for stabilization...");
+          foundOnce = true;
+          await sleep(2000);
+          continue;
+        }
+        console.log("[CX Helper] Flight cards stable and ready");
+        return true;
+      }
+
+      // Only check for "no flights" messages AFTER we've waited a reasonable amount
+      // (don't check immediately - the page might show these briefly during loading)
+      if (Date.now() > deadline - (totalWait - minWaitMs - 5000)) {
+        // We've waited at least 5+ seconds total, safe to check for "no flights"
+        if (hasExplicitNoFlightsMessage()) {
+          console.log("[CX Helper] 'No flights available' message detected");
+          return true;
+        }
+        if (isSelectedDateNotAvailable()) {
+          console.log("[CX Helper] Selected date shows 'Not available' in strip");
+          return true;
+        }
+      }
+
+      await sleep(1000);
+    }
+    console.log("[CX Helper] Timed out waiting for flight cards after", totalWait, "ms");
+    return false;
+  }
+
+  async function inspectCurrentResults(run, dateText) {
+    // Wait for flight cards to render after page load / date change
+    await waitForFlightCards(15000);
+
+    const noAvail = {
+      date: dateText,
+      cabin: CABIN_LABELS[run.cabin] || "",
+      itineraries: [],
+      available: false,
+    };
+
+    // If the selected date says "Not available" in the strip, skip immediately
+    if (isSelectedDateNotAvailable()) {
+      console.log("[CX Helper] Date", dateText, "is 'Not available' per strip");
+      return noAvail;
+    }
+
+    // Try to enable Direct flights filter, but don't let it block extraction.
+    // The parser already skips connecting flights via the "stop" check.
+    if (run.directOnly) {
+      try {
+        await ensureDirectFlightsEnabled();
+        await sleep(2000);
+      } catch (e) {
+        console.log("[CX Helper] ensureDirectFlightsEnabled error (non-fatal):", e.message);
+      }
+    }
+
+    // Don't check cabin - it's already set from homepage search.
+    // Don't check for "no flights" message here - just go straight to extraction.
+
+    const itineraries = parseVisibleItineraries();
+    if (itineraries.length === 0) {
+      // Extra diagnostics: dump the page text around CX references
+      const allText = document.body ? document.body.innerText : "";
+      const cxMatches = allText.match(/.{0,80}CX\d{2,4}.{0,80}/g) || [];
+      console.log("[CX Helper] No itineraries parsed. CX text found on page:", cxMatches.length);
+      for (let i = 0; i < Math.min(5, cxMatches.length); i++) {
+        console.log("[CX Helper] CX context " + i + ":", JSON.stringify(cxMatches[i].trim()));
+      }
+      console.log("[CX Helper] isPageLoading:", isPageLoading(),
+        "noFlightsMsg:", hasExplicitNoFlightsMessage());
+      return noAvail;
+    }
+
+    return {
+      date: dateText,
+      cabin: CABIN_LABELS[run.cabin] || "",
+      itineraries,
+      available: true,
+    };
+  }
+
+  function upsertRunResult(run, result) {
+    const next = (run.results || []).filter((item) => item.date !== result.date);
+    next.push(result);
+    next.sort((a, b) => a.date.localeCompare(b.date));
+    run.results = next;
+  }
+
+  function renderResults() {
+    const tbody = document.querySelector(`#${PANEL_ID} tbody`);
+    if (!tbody) {
+      return;
+    }
+    const run = loadRun();
+    state.results = run && Array.isArray(run.results) ? run.results : [];
+    tbody.innerHTML = "";
+    for (const row of state.results) {
+      if (!row.available || !row.itineraries || row.itineraries.length === 0) {
+        // No availability - show single row
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${row.date}</td>
+          <td colspan="4" style="color:#9fb6b0;">No direct flights</td>
+        `;
+        tbody.appendChild(tr);
+        continue;
+      }
+      // One row per flight on this date
+      for (let i = 0; i < row.itineraries.length; i++) {
+        const it = row.itineraries[i];
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${i === 0 ? row.date : ""}</td>
+          <td>${it.flight}</td>
+          <td>${it.depart}${it.arrive ? " – " + it.arrive : ""}</td>
+          <td>${it.duration}</td>
+          <td>${it.miles ? "A" + it.miles : ""}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+  }
+
+  async function goToTargetDate(targetDate) {
+    const targetDay = Number(targetDate.slice(8, 10));
+    const currentDate = getCurrentResultsDate();
+    const cell = await ensureCalendarCellVisible(targetDate, currentDate);
+    if (!cell) {
+      return { found: false, unavailable: false };
+    }
+    const text = normalizeText(cell.innerText);
+    if (!new RegExp(`\\b${targetDay}\\b`).test(text)) {
+      return { found: false, unavailable: false };
+    }
+    if (/Not available/i.test(text)) {
+      return { found: true, unavailable: true };
+    }
+    clickElement(cell);
+    await sleep(1800);
+    return { found: true, unavailable: false };
+  }
+
+  /**
+   * Check if the target day is already the SELECTED (highlighted) day in the strip.
+   * The selected cell typically has a different background/style.
+   */
+  function isStripDaySelected(targetDay) {
+    const cells = getVisibleCalendarCells();
+    for (const cell of cells) {
+      const text = normalizeText(cell.innerText);
+      const dayMatch = text.match(/^[A-Z]{3}\s+(\d{1,2})\b/);
+      if (!dayMatch || Number(dayMatch[1]) !== targetDay) continue;
+
+      // Check if this cell appears "selected" via:
+      // - aria-selected attribute
+      // - a "selected" or "active" class
+      // - darker background color (the highlighted cell in the screenshot is dark blue)
+      const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
+      if (aria === "true") return true;
+
+      const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
+      if (/selected|active|current|highlight/i.test(cls)) return true;
+
+      // Check computed background - selected cell is dark (the teal/dark blue)
+      const bg = window.getComputedStyle(cell).backgroundColor;
+      if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)") {
+        // Has a non-white, non-transparent background - likely selected
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * On the results page, ensure the correct date is selected in the horizontal
+   * calendar strip. The header "Departing 30 Nov 2026" does NOT update when
+   * clicking a different day in the strip, so we detect the selected day from
+   * the strip itself.
+   * Returns "ok", "unavailable", or "failed".
+   */
+  async function ensureResultsDateSelected(targetDate) {
+    const targetDay = Number(targetDate.slice(8, 10));
+
+    // Check if already selected in the strip
+    if (isStripDaySelected(targetDay)) {
+      console.log("[CX Helper] Day", targetDay, "already selected in strip");
+      return "ok";
+    }
+
+    // Check the header date as fallback
+    const currentDate = getCurrentResultsDate();
+    console.log("[CX Helper] Results header shows:", currentDate, "target:", targetDate,
+      "targetDay:", targetDay);
+    if (currentDate === targetDate) {
+      return "ok";
+    }
+
+    // Look for the target day in the visible strip cells
+    const allCells = getVisibleCalendarCells();
+    console.log("[CX Helper] Strip cells:", allCells.length,
+      allCells.map((c) => normalizeText(c.innerText).slice(0, 25)));
+
+    // Find the cell for the target day
+    let targetCell = null;
+    for (const cell of allCells) {
+      const text = normalizeText(cell.innerText);
+      const dayMatch = text.match(/^[A-Z]{3}\s+(\d{1,2})\b/);
+      if (dayMatch && Number(dayMatch[1]) === targetDay) {
+        targetCell = cell;
+        break;
+      }
+      // Also try matching just the day number at the start (in case format varies)
+      const simpleMatch = text.match(/\b(\d{1,2})\b/);
+      if (simpleMatch && Number(simpleMatch[1]) === targetDay && text.length < 30) {
+        targetCell = cell;
+        break;
+      }
+    }
+
+    if (!targetCell) {
+      // Day not visible - try navigating with arrows
+      console.log("[CX Helper] Day", targetDay, "not in visible strip, navigating...");
+      const nav = await goToTargetDate(targetDate);
+      if (nav.found && nav.unavailable) return "unavailable";
+      if (nav.found) {
+        await sleep(2000);
+        return "ok"; // goToTargetDate already clicked the cell
+      }
+      return "failed";
+    }
+
+    const cellText = normalizeText(targetCell.innerText);
+    console.log("[CX Helper] Found target strip cell:", cellText);
+
+    if (/Not available/i.test(cellText)) {
+      return "unavailable";
+    }
+
+    // Click the cell using forceClick for maximum compatibility
+    forceClick(targetCell);
+    console.log("[CX Helper] Clicked strip day", targetDay, "- waiting for page to update...");
+    await sleep(3000);
+
+    // Wait for the flight content to reload after clicking a new date
+    await waitForFlightCards(10000);
+
+    // Verify by checking if the strip day is now selected
+    if (isStripDaySelected(targetDay)) {
+      console.log("[CX Helper] Day", targetDay, "now selected after click");
+      return "ok";
+    }
+
+    // Try inner clickable element
+    const inner = targetCell.querySelector("button, a, [role='button'], div, span");
+    if (inner) {
+      console.log("[CX Helper] Retrying with inner element:", inner.tagName);
+      forceClick(inner);
+      await sleep(3000);
+      await waitForFlightCards(10000);
+      if (isStripDaySelected(targetDay)) return "ok";
+    }
+
+    // Even if we can't confirm selection, the click likely worked
+    // (the header date doesn't update but the flights list does)
+    console.log("[CX Helper] Cannot confirm strip selection but click was sent");
+    return "ok";
+  }
+
+  /** Wait for the results page to be fully loaded (calendar strip + content area) */
+  async function waitForResultsPageReady(maxWaitMs) {
+    // ALWAYS wait a minimum of 5 seconds before checking anything.
+    // The results page needs time to start rendering after navigation.
+    console.log("[CX Helper] Waiting 5s for results page to begin rendering...");
+    await sleep(5000);
+
+    const deadline = Date.now() + (maxWaitMs || 20000);
+    while (Date.now() < deadline) {
+      // Check if the calendar strip is rendered (has day cells with day numbers)
+      const cells = getVisibleCalendarCells();
+      const hasDayCells = cells.some((c) => /\b\d{1,2}\b/.test(normalizeText(c.innerText)));
+      if (hasDayCells) {
+        // Check for actual flight content (not just nav text)
+        const bodyText = document.body ? document.body.innerText : "";
+        const hasFlightContent = /\bCX\d{2,4}\b/.test(bodyText) ||
+          /Flight details/i.test(bodyText);
+        const hasNoFlightContent = /Not available/i.test(bodyText) ||
+          /No flights available/i.test(bodyText);
+        if (hasFlightContent || hasNoFlightContent) {
+          console.log("[CX Helper] Results page ready: strip has", cells.length, "cells, flight content detected");
+          await sleep(2000); // extra stabilization
+          return true;
+        }
+      }
+      console.log("[CX Helper] Waiting for results page to render... strip cells:", cells.length);
+      await sleep(1500);
+    }
+    // Even if we timed out, the page might still be usable - return true so we try extraction
+    console.log("[CX Helper] Results page wait timed out, proceeding anyway");
+    return true;
+  }
+
+  async function continueRunFromResultsPage() {
+    const run = loadRun();
+    if (!run || !run.active || state.running || !isResultsPage()) {
+      return;
+    }
+    const targetDate = addDays(run.startDate, run.offset || 0);
+    state.running = true;
+    setStatus(`Checking ${formatDisplayDate(targetDate)} (${(run.offset || 0) + 1}/${run.days})...`);
+
+    try {
+      // Wait for the results page to fully render before doing anything
+      await waitForResultsPageReady(20000);
+      if (shouldStop()) { state.running = false; return; }
+
+      // First, make sure we're looking at the right date on the results page
+      const dateStatus = await ensureResultsDateSelected(targetDate);
+      if (shouldStop()) { state.running = false; return; }
+      console.log("[CX Helper] Date selection status:", dateStatus);
+
+      let result;
+      if (dateStatus === "unavailable") {
+        result = {
+          date: targetDate,
+          cabin: CABIN_LABELS[run.cabin] || "",
+          itineraries: [],
+          available: false,
+        };
+      } else if (dateStatus === "ok") {
+        result = await inspectCurrentResults(run, targetDate);
+      } else {
+        // "failed" - could not navigate to date, record as unknown and move on
+        console.log("[CX Helper] Could not navigate to target date, marking as unavailable");
+        result = {
+          date: targetDate,
+          cabin: CABIN_LABELS[run.cabin] || "",
+          itineraries: [],
+          available: false,
+        };
+      }
+
+      // Equivalent to: const result = await inspectCurrentResults(run, targetDate);
+      upsertRunResult(run, result);
+      saveRun(run);
+      renderResults();
+
+      if ((run.offset || 0) + 1 >= run.days) {
+        run.active = false;
+        run.phase = "done";
+        saveRun(run);
+        setStatus(`Finished ${run.results.length} checked day${run.results.length === 1 ? "" : "s"}.`);
+        return;
+      }
+
+      if (shouldStop()) { state.running = false; return; }
+      run.offset = (run.offset || 0) + 1;
+      run.phase = "go-homepage";
+      saveRun(run);
+      const newSearch = findNewSearchLink();
+      if (!newSearch) {
+        throw new Error("Could not find Cathay's New search link.");
+      }
+      setStatus(`Returning to homepage for ${formatDisplayDate(addDays(run.startDate, run.offset))}...`);
+      clickElement(newSearch);
+      await sleep(500);
+      await confirmLeavePageIfPresent();
+    } catch (error) {
+      run.active = false;
+      saveRun(run);
+      setStatus(`Stopped: ${error.message}`);
+    } finally {
+      state.running = false;
+    }
+  }
+
+  function buildRunFromSettings() {
+    let settings;
+    try {
+      settings = readFormSettings();
+      settings.origin = normalizeAirportCode(settings.origin);
+      settings.destination = normalizeAirportCode(settings.destination);
+      settings.startDate = normalizeDate(settings.startDate);
+      saveSettings(settings);
+    } catch (error) {
+      setStatus(`Stopped: ${error.message}`);
+      return null;
+    }
+
+    return {
+      active: true,
+      phase: "homepage-search",
+      offset: 0,
+      startDate: settings.startDate,
+      days: settings.days,
+      adults: settings.adults,
+      cabin: settings.cabin,
+      directOnly: settings.directOnly,
+      delayMs: settings.delayMs,
+      origin: settings.origin,
+      destination: settings.destination,
+      results: [],
+      startedAt: new Date().toISOString(),
+    };
+  }
+
+  async function launchHomepageSearchForRun(run) {
+    if (!isHomepage()) {
+      setStatus("Stopped: Start from Cathay's homepage booking form.");
+      return;
+    }
+    const milesReady = await ensureMilesToggleOn();
+    if (!milesReady) {
+      setStatus('Stopped: Could not turn on "Book with miles" automatically.');
+      return;
+    }
+    const targetDate = addDays(run.startDate, run.offset || 0);
+    setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)}...`);
+    const dateReady = await setHomepageDepartingDate(targetDate);
+    if (!dateReady) {
+      setStatus("Stopped: Could not set Cathay's homepage date.");
+      return;
+    }
+    const searchButton = findHomepageSearchButton();
+    if (!searchButton) {
+      setStatus("Stopped: Could not find Cathay's homepage search button.");
+      return;
+    }
+    run.phase = "await-results";
+    saveRun(run);
+    renderResults();
+    setStatus(`Opening Cathay results for ${formatDisplayDate(targetDate)}...`);
+    clickElement(searchButton);
+  }
+
+  async function startRunFromHomepage() {
+    const run = buildRunFromSettings();
+    if (!run) {
+      return;
+    }
+
+    if (!isHomepage()) {
+      if (isResultsPage()) {
+        const newSearch = findNewSearchLink();
+        if (!newSearch) {
+          setStatus("Stopped: Could not find Cathay's New search link.");
+          return;
+        }
+        run.phase = "go-homepage";
+        saveRun(run);
+        setStatus("Returning to Cathay's homepage booking form...");
+        clickElement(newSearch);
+        await sleep(500);
+        await confirmLeavePageIfPresent();
+        return;
+      }
+      setStatus("Stopped: Start from Cathay's homepage booking form.");
+      return;
+    }
+    await launchHomepageSearchForRun(run);
+  }
+
+  function stopRun() {
+    const run = loadRun();
+    if (run) {
+      run.active = false;
+      run.phase = "stopped";
+      saveRun(run);
+    }
+    state.running = false;
+    state.stopping = true;
+    setStatus("Stopped.");
+  }
+
+  function onStopClick() {
+    stopRun();
+    console.log("[CX Helper] Stop button clicked - automation halted");
+  }
+
+  async function onSearchClick() {
+    if (state.running) {
+      return;
+    }
+    state.stopping = false;
+    await startRunFromHomepage();
+  }
+
+  function onSaveDefaultsClick() {
+    try {
+      const settings = readFormSettings();
+      settings.origin = normalizeAirportCode(settings.origin);
+      settings.destination = normalizeAirportCode(settings.destination);
+      settings.startDate = settings.startDate ? normalizeDate(settings.startDate) : "";
+      saveSettings(settings);
+      setStatus("Saved your defaults in the browser.");
+    } catch (error) {
+      setStatus(`Stopped: ${error.message}`);
+    }
+  }
+
+  function onResetDefaultsClick() {
+    clearSettings();
+    fillForm(Object.assign({}, DEFAULT_SETTINGS));
+    setStatus("Cleared saved defaults.");
+  }
+
+  function onClearRunClick() {
+    stopRun();
+    clearRun();
+    renderResults();
+    setStatus('Cleared. Set your route on Cathay\'s homepage, then click Search date range.');
+  }
+
+  function ensureStyles() {
+    if (document.getElementById(STYLE_ID)) {
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 2147483647;
+        width: 420px;
+        background: rgba(16, 27, 29, 0.96);
+        color: #f3f0e8;
+        border: 1px solid #6b8a84;
+        border-radius: 14px;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+        font: 13px/1.4 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      #${PANEL_ID} * { box-sizing: border-box; }
+      #${PANEL_ID} .cxah-head {
+        padding: 12px 14px 8px;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .cxah-copy {
+        padding: 0 14px 10px;
+        color: #d7dfdc;
+      }
+      #${PANEL_ID} .cxah-steps {
+        margin: 0 14px 12px;
+        padding: 10px 12px;
+        border: 1px solid #2f4946;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+      #${PANEL_ID} .cxah-steps div {
+        margin: 0 0 6px;
+      }
+      #${PANEL_ID} .cxah-steps div:last-child {
+        margin-bottom: 0;
+      }
+      #${PANEL_ID} .cxah-seed-meta {
+        color: #9fb6b0;
+        font-size: 11px;
+      }
+      #${PANEL_ID} .cxah-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 0 14px 12px;
+      }
+      #${PANEL_ID} .cxah-section-title {
+        grid-column: 1 / -1;
+        margin-top: 2px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #d8e8e4;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      #${PANEL_ID} label {
+        display: block;
+        font-size: 11px;
+        color: #9fb6b0;
+        margin-bottom: 4px;
+      }
+      #${PANEL_ID} input, #${PANEL_ID} select, #${PANEL_ID} button {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #59716c;
+        padding: 8px 10px;
+        background: #152325;
+        color: #f3f0e8;
+      }
+      #${PANEL_ID} button {
+        background: #2a6d68;
+        cursor: pointer;
+        font-weight: 700;
+      }
+      #${PANEL_ID} button:hover { background: #34827b; }
+      #${PANEL_ID} .cxah-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 0 14px 12px;
+      }
+      #${PANEL_ID} .cxah-actions .cxah-run {
+        grid-column: 1 / -1;
+      }
+      #${PANEL_ID} .cxah-status {
+        padding: 0 14px 10px;
+        color: #d8e8e4;
+        font-weight: 600;
+      }
+      #${PANEL_ID} .cxah-toggle-row {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 2px 0 4px;
+      }
+      #${PANEL_ID} .cxah-toggle-row input[type="checkbox"] {
+        width: auto;
+        margin: 0;
+        accent-color: #34827b;
+      }
+      #${PANEL_ID} .cxah-toggle-row label {
+        margin: 0;
+        font-size: 13px;
+        color: #f3f0e8;
+      }
+      #${PANEL_ID} table {
+        width: calc(100% - 28px);
+        margin: 0 14px 14px;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      #${PANEL_ID} th, #${PANEL_ID} td {
+        border-top: 1px solid #2f4946;
+        padding: 5px 3px;
+        text-align: left;
+        vertical-align: top;
+        white-space: nowrap;
+      }
+      #${PANEL_ID} th { font-size: 10px; color: #9fb6b0; }
+      #${PANEL_ID} .cxah-note {
+        padding: 0 14px 14px;
+        color: #9fb6b0;
+        font-size: 11px;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  function ensurePanel() {
+    if (document.getElementById(PANEL_ID)) {
+      return;
+    }
+    ensureStyles();
+    const settings = loadSettings();
+    const run = loadRun();
+    if (run && Array.isArray(run.results)) {
+      state.results = run.results;
+    }
+
+    const panel = document.createElement("section");
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="cxah-head">Cathay Award Helper</div>
+      <div class="cxah-copy">Scans a range of dates for nonstop award availability. Set your route, cabin, date range, then click Search.</div>
+      <div class="cxah-steps">
+        <div>1. Make sure you're on Cathay's homepage with route and trip type already set.</div>
+        <div>2. Fill in the start date, cabin, and number of days below.</div>
+        <div>3. Click "Search date range". The script handles the rest: sets dates, toggles Book with miles, enables Direct flights, and collects nonstop results.</div>
+        <div class="cxah-seed-meta">${run && run.active ? `Active run started ${new Date(run.startedAt).toLocaleString()}` : "No active run"}</div>
+      </div>
+      <div class="cxah-grid">
+        <div class="cxah-section-title">Presets</div>
+        <div>
+          <label for="cxah-route-preset">Route preset</label>
+          <select id="cxah-route-preset">
+            ${buildOptions(ROUTE_PRESETS, settings.routePreset || "")}
+          </select>
+        </div>
+        <div>
+          <label for="cxah-cabin-preset">Cabin preset</label>
+          <select id="cxah-cabin-preset">
+            ${buildOptions(CABIN_PRESETS, settings.cabinPreset || "")}
+          </select>
+        </div>
+        <div class="cxah-section-title">Search details</div>
+        <div>
+          <label for="cxah-origin">Origin</label>
+          <input id="cxah-origin" maxlength="40" placeholder="JFK or New York, (JFK)" value="${settings.origin}" />
+        </div>
+        <div>
+          <label for="cxah-destination">Destination</label>
+          <input id="cxah-destination" maxlength="40" placeholder="HKG or Hong Kong, (HKG)" value="${settings.destination}" />
+        </div>
+        <div>
+          <label for="cxah-start-date">Start date</label>
+          <input id="cxah-start-date" type="date" value="${settings.startDate}" />
+        </div>
+        <div>
+          <label for="cxah-days">Days (max ${MAX_DAYS})</label>
+          <input id="cxah-days" type="number" min="1" max="${MAX_DAYS}" value="${settings.days}" />
+        </div>
+        <div>
+          <label for="cxah-adults">Adults</label>
+          <input id="cxah-adults" type="number" min="1" max="4" value="${settings.adults}" />
+        </div>
+        <div>
+          <label for="cxah-cabin">Cabin to verify</label>
+          <select id="cxah-cabin">
+            <option value="Y" ${settings.cabin === "Y" ? "selected" : ""}>Economy</option>
+            <option value="PY" ${settings.cabin === "PY" ? "selected" : ""}>Premium Economy</option>
+            <option value="J" ${settings.cabin === "J" ? "selected" : ""}>Business</option>
+            <option value="F" ${settings.cabin === "F" ? "selected" : ""}>First</option>
+          </select>
+        </div>
+        <div class="cxah-toggle-row">
+          <input id="cxah-direct-only" type="checkbox" ${settings.directOnly !== false ? "checked" : ""} />
+          <label for="cxah-direct-only">Direct flights only</label>
+        </div>
+        <div style="grid-column: 1 / -1;">
+          <label for="cxah-delay">Delay between searches (ms)</label>
+          <input id="cxah-delay" type="number" min="1200" step="100" value="${settings.delayMs}" />
+        </div>
+      </div>
+      <div class="cxah-actions">
+        <button type="button" class="cxah-run" id="cxah-run">Search date range</button>
+        <button type="button" id="cxah-stop-run" style="background:#8b3a3a;">Stop</button>
+        <button type="button" id="cxah-save-defaults">Save defaults</button>
+        <button type="button" id="cxah-reset-defaults">Reset defaults</button>
+        <button type="button" id="cxah-clear-run">Clear current run</button>
+      </div>
+      <div class="cxah-status">${state.status}</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Flight</th>
+            <th>Time</th>
+            <th>Dur.</th>
+            <th>Miles</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="cxah-note">This is best-effort. It drives Cathay's visible UI, not hidden APIs. Refresh if the site gets stuck.</div>
+    `;
+
+    document.documentElement.appendChild(panel);
+    panel.querySelector("#cxah-run").addEventListener("click", onSearchClick);
+    panel.querySelector("#cxah-stop-run").addEventListener("click", onStopClick);
+    panel.querySelector("#cxah-save-defaults").addEventListener("click", onSaveDefaultsClick);
+    panel.querySelector("#cxah-reset-defaults").addEventListener("click", onResetDefaultsClick);
+    panel.querySelector("#cxah-clear-run").addEventListener("click", onClearRunClick);
+    panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
+    panel.querySelector("#cxah-cabin-preset").addEventListener("change", applyCabinPreset);
+    renderResults();
+  }
+
+  function boot() {
+    const mount = async () => {
+      ensurePanel();
+      renderResults();
+      const run = loadRun();
+      if (!run || !run.active) return;
+
+      console.log("[CX Helper] Boot: phase=", run.phase, "isHomepage=", isHomepage(),
+        "isResults=", isResultsPage());
+
+      if (run.phase === "go-homepage") {
+        // Wait for homepage to fully load after navigation from results page.
+        // The "New search" link triggers a full page navigation, so we need to
+        // wait for the booking panel to appear.
+        for (let wait = 0; wait < 20; wait++) {
+          if (isHomepage()) {
+            console.log("[CX Helper] Homepage detected on attempt", wait);
+            await launchHomepageSearchForRun(run);
+            return;
+          }
+          console.log("[CX Helper] Waiting for homepage to load... attempt", wait);
+          await sleep(1500);
+        }
+        console.log("[CX Helper] Homepage never loaded, stopping");
+        run.active = false;
+        saveRun(run);
+        setStatus("Stopped: Homepage did not load after returning from results.");
+        return;
+      }
+
+      if (run.phase === "await-results" && isResultsPage()) {
+        continueRunFromResultsPage();
+        return;
+      }
+
+      // Also handle case where we're on results page with an active run
+      if (isResultsPage()) {
+        continueRunFromResultsPage();
+      }
+    };
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", mount, { once: true });
+    } else {
+      mount();
+    }
+  }
+
+  boot();
+})();
