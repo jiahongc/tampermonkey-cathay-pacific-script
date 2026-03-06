@@ -385,13 +385,16 @@
     if (hasMilesToggleEnabled()) return true;
     console.log("[CX Helper] Book with miles NOT enabled, attempting toggle...");
 
-    // SAFE Strategy 1: Find role="switch" near "Book with miles" text
+    // Diagnostic: dump what's near "Book with miles" text so we can debug
+    dumpToggleDiagnostics();
+
+    // Strategy 1: Find role="switch" near "Book with miles" text
     const switches = findVisibleElements('[role="switch"], [role="checkbox"]');
     for (const sw of switches) {
       const parent = sw.closest("[class]") || sw.parentElement;
       const nearby = parent ? normalizeText(parent.innerText) : "";
       if (/book with miles/i.test(nearby)) {
-        console.log("[CX Helper] Found role=switch near toggle:",
+        console.log("[CX Helper] S1: Found role=switch near toggle:",
           sw.tagName, sw.getAttribute("aria-checked"));
         forceClick(sw);
         await sleep(1500);
@@ -402,12 +405,12 @@
       }
     }
 
-    // SAFE Strategy 2: Find input[type=checkbox] inside a label with "Book with miles"
+    // Strategy 2: Find input[type=checkbox] inside a label with "Book with miles"
     const checkboxes = findVisibleElements('input[type="checkbox"]');
     for (const cb of checkboxes) {
       const label = cb.closest("label");
       if (label && /book with miles/i.test(normalizeText(label.innerText))) {
-        console.log("[CX Helper] Found checkbox in 'Book with miles' label");
+        console.log("[CX Helper] S2: Found checkbox in 'Book with miles' label");
         forceToggle(cb);
         await sleep(1500);
         if (hasMilesToggleEnabled()) {
@@ -417,12 +420,11 @@
       }
     }
 
-    // SAFE Strategy 3: Find the smallest element with exact text "Book with miles"
-    // and click ONLY that element (not parents - that risks clicking other UI elements)
-    const allEls = findVisibleElements("span, div, label, p");
+    // Strategy 3: Find the smallest element with exact text "Book with miles" and click it
+    const allEls = findVisibleElements("span, div, label, p, button");
     const label = allEls.find((el) => normalizeText(el.innerText) === "Book with miles");
     if (label) {
-      console.log("[CX Helper] Clicking 'Book with miles' text element:",
+      console.log("[CX Helper] S3: Clicking 'Book with miles' text element:",
         label.tagName, String(label.className || "").slice(0, 60));
       forceClick(label);
       await sleep(1500);
@@ -432,10 +434,102 @@
       }
     }
 
+    // Strategy 4: Find a toggle/switch component near "Book with miles" by looking for
+    // common toggle patterns (slider, toggle track, toggle container) ONLY within the
+    // immediate parent of the "Book with miles" text element.
+    if (label) {
+      const toggleParent = label.parentElement;
+      if (toggleParent) {
+        // Look for sibling elements that look like toggle controls
+        const siblings = Array.from(toggleParent.children).filter((c) => c !== label);
+        for (const sib of siblings) {
+          const rect = sib.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0 && rect.width < 80) {
+            console.log("[CX Helper] S4: Clicking toggle sibling:",
+              sib.tagName, String(sib.className || "").slice(0, 60));
+            forceClick(sib);
+            await sleep(1500);
+            if (hasMilesToggleEnabled()) {
+              console.log("[CX Helper] Book with miles ENABLED via sibling click!");
+              return true;
+            }
+          }
+        }
+        // Also try clicking the parent itself (the toggle container)
+        const parentRect = toggleParent.getBoundingClientRect();
+        if (parentRect.width < 300 && parentRect.height < 80) {
+          console.log("[CX Helper] S4b: Clicking toggle parent container:",
+            toggleParent.tagName, String(toggleParent.className || "").slice(0, 60));
+          forceClick(toggleParent);
+          await sleep(1500);
+          if (hasMilesToggleEnabled()) {
+            console.log("[CX Helper] Book with miles ENABLED via parent click!");
+            return true;
+          }
+        }
+      }
+    }
+
+    // Strategy 5: Find any element with aria-label containing "Book with miles" or "miles"
+    const ariaEls = findVisibleElements("[aria-label]");
+    for (const el of ariaEls) {
+      const ariaLabel = el.getAttribute("aria-label") || "";
+      if (/book with miles/i.test(ariaLabel)) {
+        console.log("[CX Helper] S5: Found aria-label element:",
+          el.tagName, ariaLabel, String(el.className || "").slice(0, 60));
+        forceClick(el);
+        await sleep(1500);
+        if (hasMilesToggleEnabled()) {
+          console.log("[CX Helper] Book with miles ENABLED via aria-label!");
+          return true;
+        }
+      }
+    }
+
     // Could not toggle it - proceed anyway so we don't block date setting.
-    // The search will use cash fares, but at least the flow continues.
     console.log("[CX Helper] WARNING: Could not enable Book with miles. Proceeding anyway.");
     return true;
+  }
+
+  function dumpToggleDiagnostics() {
+    try {
+      // Find the "Book with miles" text element
+      const allEls = findVisibleElements("*");
+      const milesEl = allEls.find((el) => {
+        const text = normalizeText(el.innerText);
+        return text === "Book with miles";
+      });
+      if (!milesEl) {
+        console.log("[CX Helper] DIAG: No element with exact text 'Book with miles' found");
+        // Check if text exists anywhere
+        const bodyText = document.body ? document.body.innerText : "";
+        const idx = bodyText.indexOf("Book with miles");
+        console.log("[CX Helper] DIAG: 'Book with miles' in body text at index:", idx);
+        return;
+      }
+
+      console.log("[CX Helper] DIAG: 'Book with miles' element:",
+        milesEl.tagName, "class:", String(milesEl.className || "").slice(0, 80));
+
+      // Walk up 4 parents and log each
+      let el = milesEl;
+      for (let i = 0; i < 4 && el.parentElement; i++) {
+        el = el.parentElement;
+        const rect = el.getBoundingClientRect();
+        const childTags = Array.from(el.children).map((c) =>
+          c.tagName + (c.getAttribute("role") ? "[role=" + c.getAttribute("role") + "]" : "") +
+          (c.getAttribute("aria-checked") != null ? "[aria-checked=" + c.getAttribute("aria-checked") + "]" : "") +
+          (c.className ? "." + String(c.className).split(" ")[0].slice(0, 30) : "")
+        );
+        console.log("[CX Helper] DIAG: parent", i + 1, ":", el.tagName,
+          "class:", String(el.className || "").slice(0, 60),
+          "role:", el.getAttribute("role"),
+          "size:", Math.round(rect.width) + "x" + Math.round(rect.height),
+          "children:", childTags.join(", "));
+      }
+    } catch (e) {
+      console.log("[CX Helper] DIAG error:", e.message);
+    }
   }
 
   function findCabinTile(cabinCode) {
@@ -1364,128 +1458,92 @@
   }
 
   /**
-   * Check if the target day is already the SELECTED (highlighted) day in the strip.
-   * The selected cell typically has a different background/style.
+   * Find the strip cell element for a given day number.
+   * Returns { cell, text } or null.
    */
-  function isStripDaySelected(targetDay) {
-    const cells = getVisibleCalendarCells();
-    for (const cell of cells) {
+  function findStripCellForDay(targetDay) {
+    const allCells = getVisibleCalendarCells();
+    // Prefer the smallest cell that matches (the inner element, not the outer container)
+    let bestMatch = null;
+    let bestArea = Infinity;
+    for (const cell of allCells) {
       const text = normalizeText(cell.innerText);
-      const dayMatch = text.match(/^[A-Z]{3}\s+(\d{1,2})\b/);
-      if (!dayMatch || Number(dayMatch[1]) !== targetDay) continue;
-
-      // Check if this cell appears "selected" via:
-      // - aria-selected attribute
-      // - a "selected" or "active" class
-      // - darker background color (the highlighted cell in the screenshot is dark blue)
-      const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
-      if (aria === "true") return true;
-
-      const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
-      if (/selected|active|current|highlight/i.test(cls)) return true;
-
-      // Check computed background - selected cell is dark (the teal/dark blue)
-      const bg = window.getComputedStyle(cell).backgroundColor;
-      if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)") {
-        // Has a non-white, non-transparent background - likely selected
-        return true;
+      // Match "SAT 28" or "TUE 01" anywhere in the text (cell text may start with
+      // full day name like "Saturday 28 November SAT 28 75,000")
+      const dayMatch = text.match(/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i);
+      if (dayMatch && Number(dayMatch[1]) === targetDay) {
+        const rect = cell.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        if (area < bestArea) {
+          bestArea = area;
+          bestMatch = { cell, text };
+        }
       }
     }
-    return false;
+    return bestMatch;
   }
 
   /**
    * On the results page, ensure the correct date is selected in the horizontal
-   * calendar strip. The header "Departing 30 Nov 2026" does NOT update when
-   * clicking a different day in the strip, so we detect the selected day from
-   * the strip itself.
+   * calendar strip. Always clicks the target day cell to be sure.
    * Returns "ok", "unavailable", or "failed".
    */
   async function ensureResultsDateSelected(targetDate) {
     const targetDay = Number(targetDate.slice(8, 10));
+    const targetMonth = Number(targetDate.slice(5, 7)); // 1-12
 
-    // Check if already selected in the strip
-    if (isStripDaySelected(targetDay)) {
-      console.log("[CX Helper] Day", targetDay, "already selected in strip");
-      return "ok";
-    }
+    console.log("[CX Helper] ensureResultsDateSelected: target=", targetDate,
+      "day=", targetDay, "month=", targetMonth);
 
-    // Check the header date as fallback
-    const currentDate = getCurrentResultsDate();
-    console.log("[CX Helper] Results header shows:", currentDate, "target:", targetDate,
-      "targetDay:", targetDay);
-    if (currentDate === targetDate) {
-      return "ok";
-    }
-
-    // Look for the target day in the visible strip cells
+    // Log what the strip currently shows
     const allCells = getVisibleCalendarCells();
     console.log("[CX Helper] Strip cells:", allCells.length,
-      allCells.map((c) => normalizeText(c.innerText).slice(0, 25)));
+      allCells.map((c) => normalizeText(c.innerText).slice(0, 30)));
 
-    // Find the cell for the target day
-    let targetCell = null;
-    for (const cell of allCells) {
-      const text = normalizeText(cell.innerText);
-      const dayMatch = text.match(/^[A-Z]{3}\s+(\d{1,2})\b/);
-      if (dayMatch && Number(dayMatch[1]) === targetDay) {
-        targetCell = cell;
-        break;
-      }
-      // Also try matching just the day number at the start (in case format varies)
-      const simpleMatch = text.match(/\b(\d{1,2})\b/);
-      if (simpleMatch && Number(simpleMatch[1]) === targetDay && text.length < 30) {
-        targetCell = cell;
-        break;
-      }
-    }
+    // Also log the header date
+    const headerDate = getCurrentResultsDate();
+    console.log("[CX Helper] Results header date:", headerDate);
 
-    if (!targetCell) {
+    // Find the target day cell in the strip
+    let found = findStripCellForDay(targetDay);
+
+    if (!found) {
       // Day not visible - try navigating with arrows
-      console.log("[CX Helper] Day", targetDay, "not in visible strip, navigating...");
+      console.log("[CX Helper] Day", targetDay, "not in visible strip, navigating with arrows...");
       const nav = await goToTargetDate(targetDate);
       if (nav.found && nav.unavailable) return "unavailable";
       if (nav.found) {
         await sleep(2000);
-        return "ok"; // goToTargetDate already clicked the cell
+        return "ok";
       }
       return "failed";
     }
 
-    const cellText = normalizeText(targetCell.innerText);
-    console.log("[CX Helper] Found target strip cell:", cellText);
+    console.log("[CX Helper] Found strip cell for day", targetDay, ":", found.text);
 
-    if (/Not available/i.test(cellText)) {
+    // Check if "Not available"
+    if (/Not available/i.test(found.text)) {
+      console.log("[CX Helper] Day", targetDay, "shows 'Not available' in strip");
       return "unavailable";
     }
 
-    // Click the cell using forceClick for maximum compatibility
-    forceClick(targetCell);
-    console.log("[CX Helper] Clicked strip day", targetDay, "- waiting for page to update...");
-    await sleep(3000);
+    // ALWAYS click the target day cell to make sure it's selected.
+    // Don't rely on heuristics about whether it's "already selected" -
+    // just click it. This is safe because clicking an already-selected day is a no-op.
+    console.log("[CX Helper] Clicking strip day", targetDay);
+    forceClick(found.cell);
+    await sleep(2000);
 
-    // Wait for the flight content to reload after clicking a new date
-    await waitForFlightCards(10000);
-
-    // Verify by checking if the strip day is now selected
-    if (isStripDaySelected(targetDay)) {
-      console.log("[CX Helper] Day", targetDay, "now selected after click");
-      return "ok";
-    }
-
-    // Try inner clickable element
-    const inner = targetCell.querySelector("button, a, [role='button'], div, span");
+    // Also try clicking the inner button/link if the cell is a container
+    const inner = found.cell.querySelector("button, a, [role='button']");
     if (inner) {
-      console.log("[CX Helper] Retrying with inner element:", inner.tagName);
+      console.log("[CX Helper] Also clicking inner element:", inner.tagName);
       forceClick(inner);
-      await sleep(3000);
-      await waitForFlightCards(10000);
-      if (isStripDaySelected(targetDay)) return "ok";
+      await sleep(1000);
     }
 
-    // Even if we can't confirm selection, the click likely worked
-    // (the header date doesn't update but the flights list does)
-    console.log("[CX Helper] Cannot confirm strip selection but click was sent");
+    // Wait for flight content to load/update after clicking the day
+    await waitForFlightCards(12000);
     return "ok";
   }
 
@@ -1530,17 +1588,26 @@
     const targetDate = addDays(run.startDate, run.offset || 0);
     state.running = true;
     setStatus(`Checking ${formatDisplayDate(targetDate)} (${(run.offset || 0) + 1}/${run.days})...`);
+    console.log("[CX Helper] === continueRunFromResultsPage: target=", targetDate,
+      "offset=", run.offset, "days=", run.days);
 
     try {
       // Wait for the results page to fully render before doing anything
       await waitForResultsPageReady(20000);
       if (shouldStop()) { state.running = false; return; }
 
-      // First, make sure we're looking at the right date on the results page
-      const dateStatus = await ensureResultsDateSelected(targetDate);
+      // Navigate to the correct date in the strip
+      let dateStatus;
+      try {
+        dateStatus = await ensureResultsDateSelected(targetDate);
+      } catch (e) {
+        console.log("[CX Helper] ensureResultsDateSelected error:", e.message);
+        dateStatus = "failed";
+      }
       if (shouldStop()) { state.running = false; return; }
       console.log("[CX Helper] Date selection status:", dateStatus);
 
+      // Extract flight data
       let result;
       if (dateStatus === "unavailable") {
         result = {
@@ -1549,24 +1616,30 @@
           itineraries: [],
           available: false,
         };
-      } else if (dateStatus === "ok") {
-        result = await inspectCurrentResults(run, targetDate);
       } else {
-        // "failed" - could not navigate to date, record as unknown and move on
-        console.log("[CX Helper] Could not navigate to target date, marking as unavailable");
-        result = {
-          date: targetDate,
-          cabin: CABIN_LABELS[run.cabin] || "",
-          itineraries: [],
-          available: false,
-        };
+        // Even if dateStatus is "failed", still try to extract what's visible.
+        // We might be on the right date but just couldn't confirm it.
+        try {
+          result = await inspectCurrentResults(run, targetDate);
+        } catch (e) {
+          console.log("[CX Helper] inspectCurrentResults error:", e.message);
+          result = {
+            date: targetDate,
+            cabin: CABIN_LABELS[run.cabin] || "",
+            itineraries: [],
+            available: false,
+          };
+        }
       }
 
-      // Equivalent to: const result = await inspectCurrentResults(run, targetDate);
+      // Save result and render
       upsertRunResult(run, result);
       saveRun(run);
       renderResults();
+      console.log("[CX Helper] Saved result for", targetDate, ":",
+        result.available ? result.itineraries.length + " flights" : "unavailable");
 
+      // Check if we're done with all days
       if ((run.offset || 0) + 1 >= run.days) {
         run.active = false;
         run.phase = "done";
@@ -1576,7 +1649,59 @@
       }
 
       if (shouldStop()) { state.running = false; return; }
+
+      // Advance to the next day
       run.offset = (run.offset || 0) + 1;
+      const nextDate = addDays(run.startDate, run.offset);
+
+      // Try to check the next day directly from the strip (avoid going back to homepage)
+      const nextDay = Number(nextDate.slice(8, 10));
+      const nextCell = findStripCellForDay(nextDay);
+      if (nextCell) {
+        console.log("[CX Helper] Next day", nextDay, "is visible in strip - clicking directly");
+        saveRun(run);
+        setStatus(`Checking ${formatDisplayDate(nextDate)} (${run.offset + 1}/${run.days})...`);
+        forceClick(nextCell.cell);
+        const inner = nextCell.cell.querySelector("button, a, [role='button']");
+        if (inner) forceClick(inner);
+        await sleep(2000);
+        await waitForFlightCards(12000);
+
+        // Now extract for this next date
+        let nextResult;
+        const nextCellText = normalizeText(nextCell.text);
+        if (/Not available/i.test(nextCellText)) {
+          nextResult = { date: nextDate, cabin: CABIN_LABELS[run.cabin] || "", itineraries: [], available: false };
+        } else {
+          try {
+            nextResult = await inspectCurrentResults(run, nextDate);
+          } catch (e) {
+            console.log("[CX Helper] inspectCurrentResults error for next date:", e.message);
+            nextResult = { date: nextDate, cabin: CABIN_LABELS[run.cabin] || "", itineraries: [], available: false };
+          }
+        }
+        upsertRunResult(run, nextResult);
+        saveRun(run);
+        renderResults();
+        console.log("[CX Helper] Saved result for", nextDate, ":",
+          nextResult.available ? nextResult.itineraries.length + " flights" : "unavailable");
+
+        // Check if done after this extra day
+        if (run.offset + 1 >= run.days) {
+          run.active = false;
+          run.phase = "done";
+          saveRun(run);
+          setStatus(`Finished ${run.results.length} checked day${run.results.length === 1 ? "" : "s"}.`);
+          return;
+        }
+
+        if (shouldStop()) { state.running = false; return; }
+
+        // Still more days - go back to homepage for the remaining days
+        run.offset = run.offset + 1;
+      }
+
+      // Navigate back to homepage for the next date
       run.phase = "go-homepage";
       saveRun(run);
       const newSearch = findNewSearchLink();
@@ -1588,6 +1713,7 @@
       await sleep(500);
       await confirmLeavePageIfPresent();
     } catch (error) {
+      console.log("[CX Helper] continueRunFromResultsPage FATAL error:", error.message, error.stack);
       run.active = false;
       saveRun(run);
       setStatus(`Stopped: ${error.message}`);
@@ -1627,23 +1753,29 @@
   }
 
   async function launchHomepageSearchForRun(run) {
+    console.log("[CX Helper] launchHomepageSearchForRun: starting, isHomepage=", isHomepage());
     if (!isHomepage()) {
       setStatus("Stopped: Start from Cathay's homepage booking form.");
       return;
     }
+    setStatus("Enabling Book with miles...");
     const milesReady = await ensureMilesToggleOn();
+    console.log("[CX Helper] ensureMilesToggleOn returned:", milesReady);
     if (!milesReady) {
       setStatus('Stopped: Could not turn on "Book with miles" automatically.');
       return;
     }
     const targetDate = addDays(run.startDate, run.offset || 0);
     setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)}...`);
+    console.log("[CX Helper] About to set homepage date to:", targetDate);
     const dateReady = await setHomepageDepartingDate(targetDate);
+    console.log("[CX Helper] setHomepageDepartingDate returned:", dateReady);
     if (!dateReady) {
       setStatus("Stopped: Could not set Cathay's homepage date.");
       return;
     }
     const searchButton = findHomepageSearchButton();
+    console.log("[CX Helper] findHomepageSearchButton:", searchButton ? searchButton.tagName + " '" + normalizeText(searchButton.innerText) + "'" : "NOT FOUND");
     if (!searchButton) {
       setStatus("Stopped: Could not find Cathay's homepage search button.");
       return;
