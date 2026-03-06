@@ -75,12 +75,20 @@
   }
 
   function loadSettings() {
+    // Try localStorage first (same-origin persistence)
+    let saved = null;
     try {
-      const parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
-      return Object.assign({}, DEFAULT_SETTINGS, parsed || {});
-    } catch (_) {
-      return Object.assign({}, DEFAULT_SETTINGS);
+      saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+    } catch (_) {}
+
+    // Also check the run object in window.name (survives cross-origin navigation)
+    const run = loadRun();
+    if (run && run.settings) {
+      // Merge: run.settings wins over localStorage for cross-origin scenarios
+      saved = Object.assign({}, saved || {}, run.settings);
     }
+
+    return Object.assign({}, DEFAULT_SETTINGS, saved || {});
   }
 
   function saveSettings(settings) {
@@ -1196,13 +1204,18 @@
     }
     console.log("[CX Helper] Text: Found CX numbers:", allCX.map((c) => c.flight));
 
-    const hits = [];
-    const seen = new Set();
+    // Group by flight number - use the LAST occurrence of each (most likely the
+    // actual flight card, not header metadata)
+    const lastOccurrence = new Map();
     for (const cx of allCX) {
-      if (seen.has(cx.flight)) continue;
-      // Extract a window of text around this flight number (500 chars after)
-      const window = bodyText.slice(Math.max(0, cx.index - 100), cx.index + 500);
-      const windowNorm = normalizeText(window);
+      lastOccurrence.set(cx.flight, cx);
+    }
+
+    const hits = [];
+    for (const [flight, cx] of lastOccurrence) {
+      // Extract a wide window around this flight number (800 chars after to reach miles)
+      const win = bodyText.slice(Math.max(0, cx.index - 50), cx.index + 800);
+      const windowNorm = normalizeText(win);
 
       // Check if this is a connecting flight (has "stop" nearby)
       if (/\d+\s+stop/i.test(windowNorm)) continue;
@@ -1211,9 +1224,8 @@
       const times = windowNorm.match(/\d{1,2}:\d{2}/g) || [];
       if (times.length === 0) continue;
 
-      seen.add(cx.flight);
-      console.log("[CX Helper] Text: Extracting", cx.flight, "from:", JSON.stringify(windowNorm.slice(0, 200)));
-      hits.push(extractFlightDetails(cx.flight, windowNorm));
+      console.log("[CX Helper] Text: Extracting", flight, "from:", JSON.stringify(windowNorm.slice(0, 300)));
+      hits.push(extractFlightDetails(flight, windowNorm));
     }
     return hits;
   }
@@ -1227,19 +1239,38 @@
     const arriveDisplay = arrive + (arriveNextDay ? "+1" : "");
     const durationMatch = text.match(/(\d{1,2}h\s*\d{1,2}m)/);
     const duration = durationMatch ? durationMatch[1] : "";
-    const milesMatch = text.match(/(\d{2,3}[,.]?\d{3})/g);
+
+    // Extract miles - look for Asia Miles format "A75,000" first, then generic numbers
     let miles = "";
-    if (milesMatch) {
-      // Filter out likely non-miles numbers (like times that matched as numbers)
-      const mileCandidates = milesMatch.filter((m) => {
-        const num = Number(m.replace(/[,.]/g, ""));
-        return num >= 10000 && num <= 999000;
-      });
-      if (mileCandidates.length > 0) {
-        miles = mileCandidates[mileCandidates.length - 1].replace(/[,.]/g, "");
+
+    // Priority 1: "A" prefix miles (e.g. "A75,000" or "A 75,000")
+    const asiaMilesMatch = text.match(/A\s*(\d{2,3}[,.]?\d{3})/g);
+    if (asiaMilesMatch) {
+      for (const am of asiaMilesMatch) {
+        const numStr = am.replace(/[^0-9]/g, "");
+        const num = Number(numStr);
+        if (num >= 10000 && num <= 999000) {
+          miles = numStr;
+          break;
+        }
       }
     }
-    console.log("[CX Helper] Parsed:", flight, depart, "→", arriveDisplay, duration, miles ? miles + " miles" : "");
+
+    // Priority 2: Generic large numbers (fallback)
+    if (!miles) {
+      const milesMatch = text.match(/(\d{2,3}[,.]?\d{3})/g);
+      if (milesMatch) {
+        const mileCandidates = milesMatch.filter((m) => {
+          const num = Number(m.replace(/[,.]/g, ""));
+          return num >= 10000 && num <= 999000;
+        });
+        if (mileCandidates.length > 0) {
+          miles = mileCandidates[mileCandidates.length - 1].replace(/[,.]/g, "");
+        }
+      }
+    }
+
+    console.log("[CX Helper] Parsed:", flight, depart, "→", arriveDisplay, duration, miles ? miles + " miles" : "NO MILES");
     return {
       flight,
       depart,
@@ -1747,6 +1778,7 @@
       delayMs: settings.delayMs,
       origin: settings.origin,
       destination: settings.destination,
+      settings: settings, // preserve form values across cross-origin navigation
       results: [],
       startedAt: new Date().toISOString(),
     };
