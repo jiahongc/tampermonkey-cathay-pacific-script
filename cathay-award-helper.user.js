@@ -1135,7 +1135,13 @@
   function parseVisibleItineraries() {
     const hitsA = parseFlightsFromDOM();
     const hitsB = parseFlightsFromPageText();
-    console.log("[CX Helper] DOM strategy found:", hitsA.length, "flights. Text strategy found:", hitsB.length, "flights");
+    const milesA = hitsA.filter((h) => h.miles).length;
+    const milesB = hitsB.filter((h) => h.miles).length;
+    console.log("[CX Helper] DOM strategy:", hitsA.length, "flights (" + milesA + " with miles).",
+      "Text strategy:", hitsB.length, "flights (" + milesB + " with miles).");
+    // Prefer the strategy that found more miles; tie-break by flight count
+    if (milesA > milesB) return hitsA;
+    if (milesB > milesA) return hitsB;
     return hitsA.length >= hitsB.length ? hitsA : hitsB;
   }
 
@@ -1144,7 +1150,12 @@
     const allDivs = findVisibleElements("div, article, section, li");
     const flightRelated = allDivs.filter((el) => {
       const text = normalizeText(el.innerText);
-      return text.length > 15 && text.length < 1500 && /\bCX\d{2,4}\b/.test(text);
+      if (text.length <= 15 || text.length > 1500) return false;
+      if (!/\bCX\d{2,4}\b/.test(text)) return false;
+      // Filter out giant containers — individual flight cards should be < 800px wide/tall
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 800 || rect.height > 800) return false;
+      return true;
     });
     console.log("[CX Helper] DOM: Elements with CX numbers:", flightRelated.length);
     for (let i = 0; i < Math.min(3, flightRelated.length); i++) {
