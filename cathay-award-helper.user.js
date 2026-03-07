@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cathay Award Helper
 // @namespace    codex.local
-// @version      0.2.0
+// @version      0.3.0
 // @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
 // @author       jiahongc
 // @license      MIT
@@ -21,16 +21,19 @@
   const SETTINGS_KEY = "cx-award-helper-settings-v2";
   const RUN_KEY = "cx-award-helper-run-v2";
   const WINDOW_NAME_PREFIX = "__cx_award_helper__:";
+  const LOG_PREFIX = "[CX Helper]";
+  const MAX_LOG_LINES = 250;
   const MAX_DAYS = 14;
   const DEFAULT_DELAY_S = 2;
+  const CABIN_CODES = ["Y", "PY", "J", "F"];
   const DEFAULT_SETTINGS = {
     routePreset: "JFK-HKG",
     origin: "JFK",
     destination: "HKG",
     startDate: "",
-    days: 7,
+    days: 3,
     adults: 1,
-    cabin: "PY",
+    cabins: ["PY"],
     directOnly: true,
     delayS: DEFAULT_DELAY_S,
     // Legacy compat: delayMs is converted to delayS on load
@@ -56,7 +59,55 @@
     stopping: false,
     status: 'Start from Cathay\'s homepage with "Book with miles" turned on.',
     results: [],
+    logs: [],
   };
+
+  function formatLogArg(arg) {
+    if (typeof arg === "string") {
+      return arg;
+    }
+    if (arg instanceof Error) {
+      return arg.stack || arg.message;
+    }
+    try {
+      return JSON.stringify(arg);
+    } catch (_) {
+      return String(arg);
+    }
+  }
+
+  function renderDebugLog() {
+    const el = document.getElementById("cxah-debug-log");
+    if (!el) {
+      return;
+    }
+    el.value = state.logs.join("\n");
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function pushDebugLog(args) {
+    const line = args.map(formatLogArg).join(" ");
+    state.logs.push(line);
+    if (state.logs.length > MAX_LOG_LINES) {
+      state.logs = state.logs.slice(-MAX_LOG_LINES);
+    }
+    savePersistedLogs(state.logs);
+    renderDebugLog();
+  }
+
+  function ensureLogBridge() {
+    if (console.__cxHelperLogPatched) {
+      return;
+    }
+    const originalLog = console.log.bind(console);
+    console.log = function (...args) {
+      originalLog(...args);
+      if (String(args[0] || "").startsWith(LOG_PREFIX)) {
+        pushDebugLog(args);
+      }
+    };
+    console.__cxHelperLogPatched = true;
+  }
 
   function shouldStop() {
     if (state.stopping) return true;
@@ -86,6 +137,14 @@
     if (merged.delayMs && !merged.delayS) {
       merged.delayS = Math.round(merged.delayMs / 1000);
     }
+    if (!Array.isArray(merged.cabins) || merged.cabins.length === 0) {
+      merged.cabins = merged.cabin ? [merged.cabin] : DEFAULT_SETTINGS.cabins.slice();
+    }
+    merged.cabins = merged.cabins.filter((code, index) => CABIN_CODES.includes(code) && merged.cabins.indexOf(code) === index);
+    if (merged.cabins.length === 0) {
+      merged.cabins = DEFAULT_SETTINGS.cabins.slice();
+    }
+    merged.cabin = merged.cabins[0];
     delete merged.delayMs;
     delete merged.cabinPreset; // removed field
     return merged;
@@ -99,27 +158,58 @@
     localStorage.removeItem(SETTINGS_KEY);
   }
 
-  function loadRun() {
+  function loadWindowPayload() {
     try {
       const raw = String(window.name || "");
       if (!raw.startsWith(WINDOW_NAME_PREFIX)) {
-        return null;
+        return { run: null, logs: [] };
       }
-      return JSON.parse(raw.slice(WINDOW_NAME_PREFIX.length) || "null");
+      const parsed = JSON.parse(raw.slice(WINDOW_NAME_PREFIX.length) || "null");
+      if (parsed && typeof parsed === "object" && ("run" in parsed || "logs" in parsed)) {
+        return {
+          run: parsed.run || null,
+          logs: Array.isArray(parsed.logs) ? parsed.logs : [],
+        };
+      }
+      return { run: parsed || null, logs: [] };
     } catch (_) {
-      return null;
+      return { run: null, logs: [] };
     }
+  }
+
+  function saveWindowPayload(payload) {
+    const next = {
+      run: payload && payload.run ? payload.run : null,
+      logs: payload && Array.isArray(payload.logs) ? payload.logs.slice(-MAX_LOG_LINES) : [],
+    };
+    window.name = WINDOW_NAME_PREFIX + JSON.stringify(next);
+  }
+
+  function loadPersistedLogs() {
+    return loadWindowPayload().logs || [];
+  }
+
+  function savePersistedLogs(logs) {
+    const payload = loadWindowPayload();
+    payload.logs = Array.isArray(logs) ? logs.slice(-MAX_LOG_LINES) : [];
+    saveWindowPayload(payload);
+  }
+
+  function loadRun() {
+    return loadWindowPayload().run;
   }
 
   function saveRun(run) {
-    window.name = WINDOW_NAME_PREFIX + JSON.stringify(run);
+    const payload = loadWindowPayload();
+    payload.run = run || null;
+    payload.logs = state.logs.slice(-MAX_LOG_LINES);
+    saveWindowPayload(payload);
   }
 
   function clearRun() {
-    const raw = String(window.name || "");
-    if (raw.startsWith(WINDOW_NAME_PREFIX)) {
-      window.name = "";
-    }
+    const payload = loadWindowPayload();
+    payload.run = null;
+    saveWindowPayload(payload);
   }
 
   function getField(id) {
@@ -185,9 +275,83 @@
     });
   }
 
+  function escapeRegExp(text) {
+    return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function getCabinLabel(cabinCode) {
+    return CABIN_LABELS[cabinCode] || cabinCode || "";
+  }
+
+  function matchesCabinTileText(text, cabinCode) {
+    const label = getCabinLabel(cabinCode);
+    const normalized = normalizeText(text);
+    if (!label || !normalized) {
+      return false;
+    }
+    return new RegExp(`^${escapeRegExp(label)}(?:\\b|\\s|$)`, "i").test(normalized);
+  }
+
+  function normalizeCabinCodes(input) {
+    const raw = Array.isArray(input) ? input : input ? [input] : [];
+    const filtered = raw.filter((code, index) => CABIN_CODES.includes(code) && raw.indexOf(code) === index);
+    return filtered.length ? filtered : DEFAULT_SETTINGS.cabins.slice();
+  }
+
+  function getRunCabinCodes(runOrSettings) {
+    return normalizeCabinCodes(
+      (runOrSettings && (runOrSettings.cabinCodes || runOrSettings.cabins)) ||
+      (runOrSettings && runOrSettings.cabin)
+    );
+  }
+
+  function getSeedCabin(run) {
+    return run.seedCabin || getRunCabinCodes(run)[0];
+  }
+
+  function cabinSortValue(code) {
+    const index = CABIN_CODES.indexOf(code);
+    return index === -1 ? CABIN_CODES.length : index;
+  }
+
+  function getCabinCheckboxIds() {
+    return {
+      Y: "cxah-cabin-y",
+      PY: "cxah-cabin-py",
+      J: "cxah-cabin-j",
+      F: "cxah-cabin-f",
+    };
+  }
+
+  function formatCabinList(cabins) {
+    return normalizeCabinCodes(cabins).map((code) => getCabinLabel(code)).join(", ");
+  }
+
+  function getRunLastDate(run) {
+    return addDays(run.startDate, Math.max(0, (run.days || 1) - 1));
+  }
+
+  function isDateWithinRun(run, dateText) {
+    return Boolean(dateText) && dateText >= run.startDate && dateText <= getRunLastDate(run);
+  }
+
+  function getDateOffset(run, dateText) {
+    const start = new Date(`${run.startDate}T00:00:00`);
+    const end = new Date(`${dateText}T00:00:00`);
+    return Math.round((end - start) / 86400000);
+  }
+
   function readFormSettings() {
     const routePreset = getField("cxah-route-preset").value;
     const route = ROUTE_PRESETS.find((item) => item.value === routePreset);
+    const cabinIds = getCabinCheckboxIds();
+    const cabins = CABIN_CODES.filter((code) => {
+      const el = getField(cabinIds[code]);
+      return el && el.checked;
+    });
+    if (cabins.length === 0) {
+      throw new Error("Select at least one cabin.");
+    }
     return {
       routePreset,
       origin: getField("cxah-origin").value.trim() || (route && route.origin) || "",
@@ -195,20 +359,27 @@
       startDate: getField("cxah-start-date").value,
       days: Math.max(1, Math.min(MAX_DAYS, Number(getField("cxah-days").value) || DEFAULT_SETTINGS.days)),
       adults: Math.max(1, Math.min(4, Number(getField("cxah-adults").value) || DEFAULT_SETTINGS.adults)),
-      cabin: getField("cxah-cabin").value,
+      cabins: normalizeCabinCodes(cabins),
       directOnly: Boolean(getField("cxah-direct-only").checked),
       delayS: Math.max(1, Number(getField("cxah-delay").value) || DEFAULT_DELAY_S),
     };
   }
 
   function fillForm(settings) {
+    const cabins = getRunCabinCodes(settings);
+    const cabinIds = getCabinCheckboxIds();
     getField("cxah-route-preset").value = settings.routePreset || "";
     getField("cxah-origin").value = settings.origin || "";
     getField("cxah-destination").value = settings.destination || "";
     getField("cxah-start-date").value = settings.startDate || "";
     getField("cxah-days").value = settings.days || DEFAULT_SETTINGS.days;
     getField("cxah-adults").value = settings.adults || DEFAULT_SETTINGS.adults;
-    getField("cxah-cabin").value = settings.cabin || "";
+    CABIN_CODES.forEach((code) => {
+      const el = getField(cabinIds[code]);
+      if (el) {
+        el.checked = cabins.includes(code);
+      }
+    });
     getField("cxah-direct-only").checked = settings.directOnly !== false;
     getField("cxah-delay").value = settings.delayS || DEFAULT_DELAY_S;
   }
@@ -245,8 +416,15 @@
     }
   }
 
+  function isInsideHelperPanel(el) {
+    return Boolean(el && el.closest && el.closest(`#${PANEL_ID}`));
+  }
+
   function findVisibleElements(selector) {
     return Array.from(document.querySelectorAll(selector)).filter((el) => {
+      if (isInsideHelperPanel(el)) {
+        return false;
+      }
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     });
@@ -274,9 +452,23 @@
     return /Book a trip/.test(text) && /(Redeem flights|Search flights)/.test(text);
   }
 
-  function isResultsPage() {
+  function isResultsLikePage() {
     const text = document.body ? document.body.innerText : "";
-    return /Select flights/.test(text) || /Lowest miles shown on the calendar/.test(text);
+    if (/Select flights/.test(text) || /Lowest miles shown on the calendar/.test(text)) {
+      return true;
+    }
+    if (hasNoAvailabilityModalText(text)) {
+      return true;
+    }
+    const hasDepartHeader = /\bDepart\b/i.test(text);
+    const hasDetails = /View full details|Flight details/i.test(text);
+    const hasFilter = /\bFilter\b/i.test(text);
+    const hasDateStrip = getVisibleCalendarCells().length >= 5;
+    return hasDateStrip && hasDepartHeader && (hasDetails || hasFilter);
+  }
+
+  function isResultsPage() {
+    return isResultsLikePage();
   }
 
   function hasMilesToggleEnabled() {
@@ -529,65 +721,85 @@
     }
   }
 
-  function findCabinTile(cabinCode) {
-    const label = CABIN_LABELS[cabinCode];
-    if (!label) {
-      return null;
+  function isActiveCabinTile(el) {
+    if (!el) {
+      return false;
     }
-    return findVisibleElements("button, div, a").find((el) => {
+    const aria = String(el.getAttribute("aria-selected") || el.getAttribute("aria-current") || "");
+    const cls = [el.className, el.parentElement && el.parentElement.className].filter(Boolean).join(" ");
+    const bg = window.getComputedStyle(el).backgroundColor;
+    return aria === "true" ||
+      /selected|active|current/i.test(cls) ||
+      Boolean(bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
+  }
+
+  function findVisibleCabinTiles() {
+    const tiles = new Map();
+    const candidates = findVisibleElements("button, div, a, span").filter((el) => {
       const text = normalizeText(el.innerText);
-      if (!text) {
-        return false;
-      }
-      if (!text.includes(label)) {
-        return false;
-      }
-      if (/View full details/i.test(text)) {
-        return false;
-      }
       const rect = el.getBoundingClientRect();
-      return rect.width > 120 && rect.height > 80;
+      if (!text || text.length > 120) {
+        return false;
+      }
+      if (rect.width < 60 || rect.height < 18 || rect.width > 600 || rect.height > 260) {
+        return false;
+      }
+      if (/View full details|Flight details|Recommended|Direct flights/i.test(text)) {
+        return false;
+      }
+      return CABIN_CODES.some((code) => matchesCabinTileText(text, code));
     });
+
+    for (const el of candidates) {
+      const text = normalizeText(el.innerText);
+      for (const code of ["PY", "F", "J", "Y"]) {
+        const label = getCabinLabel(code);
+        if (!matchesCabinTileText(text, code)) {
+          continue;
+        }
+        const rect = el.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        const existing = tiles.get(code);
+        if (!existing || area < existing.area) {
+          tiles.set(code, {
+            code,
+            label,
+            el,
+            text,
+            area,
+            active: isActiveCabinTile(el),
+          });
+        }
+      }
+    }
+
+    const summary = Array.from(tiles.values()).map((tile) => `${tile.code}:${tile.active ? "active" : "inactive"}:${tile.text.slice(0, 40)}`);
+    console.log("[CX Helper] Cabin tile scan:", summary.length ? summary : "none");
+    return tiles;
   }
 
-  /** Check if the desired cabin is already displayed on the results page */
-  function isCabinAlreadyShowing(cabinCode) {
-    const label = CABIN_LABELS[cabinCode];
-    if (!label) return false;
-    // Look for the cabin label prominently displayed (the dark tile header)
-    const bodyText = document.body ? document.body.innerText : "";
-    // The cabin tile shows e.g. "Premium Economy\nFROM A75,000" at the top of results
-    return new RegExp(label, "i").test(bodyText);
+  function findCabinTile(cabinCode) {
+    return (findVisibleCabinTiles().get(cabinCode) || {}).el || null;
   }
 
-  async function selectCabinOnResults(cabinCode) {
+  async function selectCabinOnResults(cabinCode, currentCabinCode) {
     if (!cabinCode) {
       return true;
     }
-
-    // If the cabin is already showing on the page, don't click anything.
-    // The results page displays the cabin from the homepage search.
-    // Clicking the cabin tile again can disrupt the page.
-    if (isCabinAlreadyShowing(cabinCode)) {
-      console.log("[CX Helper] Cabin", cabinCode, "already showing on results page, skipping click");
+    if (currentCabinCode === cabinCode) {
+      console.log("[CX Helper] Cabin", cabinCode, "already active by state");
       return true;
     }
-
-    // Cabin not showing - try to find and click the tile to switch
-    const tile = findCabinTile(cabinCode);
-    if (!tile) {
-      // Check if any flight cards are visible anyway
-      const hasFlightCards = findVisibleElements("div, article, section").some((el) => {
-        const text = normalizeText(el.innerText);
-        return /Flight details/i.test(text) && /\b(CX|KA|[A-Z]{2})\d{2,4}\b/.test(text);
-      });
-      console.log("[CX Helper] Cabin tile not found for", cabinCode,
-        "- flight cards visible:", hasFlightCards);
-      return hasFlightCards;
+    const tiles = findVisibleCabinTiles();
+    const tileInfo = tiles.get(cabinCode);
+    if (!tileInfo || !tileInfo.el) {
+      console.log("[CX Helper] Cabin tile not found for", cabinCode);
+      return false;
     }
-    console.log("[CX Helper] Clicking cabin tile for", cabinCode);
-    clickElement(tile);
-    await sleep(1400);
+    console.log("[CX Helper] Clicking cabin tile for", cabinCode, "text:", tileInfo.text);
+    clickElement(tileInfo.el);
+    await sleep(1800);
+    await waitForFlightCards(12000);
     return true;
   }
 
@@ -601,6 +813,64 @@
       const lines = text.split(/\s+/);
       return lines.some((part) => dayNumbers.has(part.padStart(2, "0"))) && (/\bNot available\b/i.test(text) || /A\d|HKD|\$\d/.test(text) || /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(text));
     });
+  }
+
+  function isCalendarStripCellSelected(cell) {
+    const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
+    const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
+    const bg = window.getComputedStyle(cell).backgroundColor;
+    return aria === "true" ||
+      /selected|active|current|highlight/i.test(cls) ||
+      (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
+  }
+
+  function getOrderedStripCells() {
+    const bestByDay = new Map();
+    for (const cell of getVisibleCalendarCells()) {
+      const text = normalizeText(cell.innerText);
+      const dayMatch = text.match(/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i) || text.match(/\b(\d{1,2})\b/);
+      if (!dayMatch) {
+        continue;
+      }
+      const day = Number(dayMatch[1]);
+      const rect = cell.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      const existing = bestByDay.get(day);
+      if (!existing || area < existing.area) {
+        bestByDay.set(day, {
+          day,
+          cell,
+          text,
+          area,
+          left: rect.left,
+          selected: isCalendarStripCellSelected(cell),
+        });
+      }
+    }
+    return Array.from(bestByDay.values()).sort((a, b) => a.left - b.left);
+  }
+
+  function getVisibleStripSnapshot(baseDateText) {
+    const cells = getOrderedStripCells();
+    if (!cells.length) {
+      return [];
+    }
+    let selectedIndex = cells.findIndex((entry) => entry.selected);
+    const baseDate = baseDateText || getCurrentResultsDate();
+    if (selectedIndex === -1 && baseDate) {
+      const baseDay = Number(baseDate.slice(8, 10));
+      selectedIndex = cells.findIndex((entry) => entry.day === baseDay);
+    }
+    if (selectedIndex === -1 || !baseDate) {
+      return cells.map((entry) => Object.assign({}, entry, {
+        date: "",
+        unavailable: /Not available/i.test(entry.text),
+      }));
+    }
+    return cells.map((entry, index) => Object.assign({}, entry, {
+      date: addDays(baseDate, index - selectedIndex),
+      unavailable: /Not available/i.test(entry.text),
+    }));
   }
 
   function findCalendarCellForDay(dayNumber) {
@@ -772,6 +1042,40 @@
     }
     clickElement(leaveButton);
     await sleep(900);
+    return true;
+  }
+
+  function hasNoAvailabilityModalText(text) {
+    return /There are no available flights for that date/i.test(String(text || "")) ||
+      /There are no flights available for the date and\/or award type you have selected/i.test(String(text || ""));
+  }
+
+  function findNoAvailabilityModalCloseButton() {
+    const exactClose = findVisibleElements("button, a, div, span").find((el) => /^Close$/i.test(normalizeText(el.innerText)));
+    if (exactClose) {
+      return exactClose;
+    }
+    return findVisibleElements("button, a, div, span").find((el) => {
+      const text = normalizeText(el.innerText);
+      const aria = String(el.getAttribute("aria-label") || el.getAttribute("title") || "");
+      return /^×$|^x$/i.test(text) || /close/i.test(aria);
+    });
+  }
+
+  async function dismissNoAvailabilityModalIfPresent() {
+    const bodyText = document.body ? document.body.innerText : "";
+    if (!hasNoAvailabilityModalText(bodyText)) {
+      return false;
+    }
+    const closeBtn = findNoAvailabilityModalCloseButton();
+    console.log("[CX Helper] No-availability modal detected");
+    if (!closeBtn) {
+      console.log("[CX Helper] No-availability modal close button not found");
+      return false;
+    }
+    console.log("[CX Helper] Closing no-availability modal via", closeBtn.tagName, normalizeText(closeBtn.innerText) || (closeBtn.getAttribute("aria-label") || ""));
+    clickElement(closeBtn);
+    await sleep(1200);
     return true;
   }
 
@@ -1145,6 +1449,10 @@
     return hitsA.length >= hitsB.length ? hitsA : hitsB;
   }
 
+  function hasNoRedemptionSeatsText(text) {
+    return /There are no redemption seats available for this flight/i.test(String(text || ""));
+  }
+
   /** Strategy A: Find flight cards in the DOM */
   function parseFlightsFromDOM() {
     const allDivs = findVisibleElements("div, article, section, li");
@@ -1182,6 +1490,7 @@
       if (seen.has(flight)) continue;
       const times = text.match(/\d{1,2}:\d{2}/g) || [];
       if (times.length === 0) continue;
+      if (hasNoRedemptionSeatsText(text)) continue;
       const stopMatch = text.match(/(\d+)\s+stop/i);
       if (stopMatch && Number(stopMatch[1]) > 0) continue;
       seen.add(flight);
@@ -1219,6 +1528,7 @@
 
       // Check if this is a connecting flight (has "stop" nearby)
       if (/\d+\s+stop/i.test(windowNorm)) continue;
+      if (hasNoRedemptionSeatsText(windowNorm)) continue;
 
       // Must have time patterns nearby
       const times = windowNorm.match(/\d{1,2}:\d{2}/g) || [];
@@ -1284,6 +1594,8 @@
     const text = document.body ? document.body.innerText : "";
     if (/No flights available/i.test(text) ||
       /no available flights/i.test(text) ||
+      hasNoAvailabilityModalText(text) ||
+      /There are no redemption seats available for this flight/i.test(text) ||
       /no results found/i.test(text) ||
       /Sorry, there are no/i.test(text)) return true;
     return false;
@@ -1291,17 +1603,9 @@
 
   /** Check if the currently selected strip cell says "Not available" */
   function isSelectedDateNotAvailable() {
-    const cells = getVisibleCalendarCells();
+    const cells = getOrderedStripCells();
     for (const cell of cells) {
-      const text = normalizeText(cell.innerText);
-      // Check if this cell is the selected one (dark background)
-      const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
-      const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
-      const bg = window.getComputedStyle(cell).backgroundColor;
-      const isSelected = aria === "true" ||
-        /selected|active|current|highlight/i.test(cls) ||
-        (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
-      if (isSelected && /not available/i.test(text)) {
+      if (cell.selected && /not available/i.test(cell.text)) {
         return true;
       }
     }
@@ -1374,16 +1678,26 @@
     return false;
   }
 
-  async function inspectCurrentResults(run, dateText) {
-    // Wait for flight cards to render after page load / date change
-    await waitForFlightCards(15000);
-
-    const noAvail = {
+  function buildUnavailableResult(dateText, cabinCode) {
+    return {
       date: dateText,
-      cabin: CABIN_LABELS[run.cabin] || "",
+      cabinCode,
+      cabin: getCabinLabel(cabinCode),
       itineraries: [],
       available: false,
     };
+  }
+
+  async function inspectCurrentResults(run, dateText, cabinCode) {
+    const noAvail = buildUnavailableResult(dateText, cabinCode);
+
+    // Wait for flight cards to render after page load / date change
+    await waitForFlightCards(15000);
+
+    if (await dismissNoAvailabilityModalIfPresent()) {
+      console.log("[CX Helper] Dismissed no-availability modal for", dateText, cabinCode);
+      return noAvail;
+    }
 
     // If the selected date says "Not available" in the strip, skip immediately
     if (isSelectedDateNotAvailable()) {
@@ -1421,17 +1735,53 @@
 
     return {
       date: dateText,
-      cabin: CABIN_LABELS[run.cabin] || "",
+      cabinCode,
+      cabin: getCabinLabel(cabinCode),
       itineraries,
       available: true,
     };
   }
 
+  function getResultKey(result) {
+    return `${result.date}__${result.cabinCode || ""}`;
+  }
+
+  function hasRunResult(run, dateText, cabinCode) {
+    return (run.results || []).some((item) => item.date === dateText && item.cabinCode === cabinCode);
+  }
+
+  function getRunResult(run, dateText, cabinCode) {
+    return (run.results || []).find((item) => item.date === dateText && item.cabinCode === cabinCode) || null;
+  }
+
   function upsertRunResult(run, result) {
-    const next = (run.results || []).filter((item) => item.date !== result.date);
+    const next = (run.results || []).filter((item) => getResultKey(item) !== getResultKey(result));
     next.push(result);
-    next.sort((a, b) => a.date.localeCompare(b.date));
+    next.sort((a, b) => {
+      const dateCompare = a.date.localeCompare(b.date);
+      if (dateCompare !== 0) {
+        return dateCompare;
+      }
+      return cabinSortValue(a.cabinCode) - cabinSortValue(b.cabinCode);
+    });
     run.results = next;
+  }
+
+  function findNextPendingSeed(run) {
+    const cabins = getRunCabinCodes(run);
+    for (let offset = 0; offset < run.days; offset += 1) {
+      const dateText = addDays(run.startDate, offset);
+      for (const cabinCode of cabins) {
+        if (!hasRunResult(run, dateText, cabinCode)) {
+          return { offset, dateText, cabinCode };
+        }
+      }
+    }
+    return null;
+  }
+
+  function hasFinishedAllResults(run) {
+    return !findNextPendingSeed(run);
   }
 
   function renderResults() {
@@ -1448,6 +1798,7 @@
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${row.date}</td>
+          <td>${row.cabin || ""}</td>
           <td colspan="4" style="color:#9fb6b0;">No direct flights</td>
         `;
         tbody.appendChild(tr);
@@ -1459,6 +1810,7 @@
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${i === 0 ? row.date : ""}</td>
+          <td>${i === 0 ? row.cabin : ""}</td>
           <td>${it.flight}</td>
           <td>${it.depart}${it.arrive ? " – " + it.arrive : ""}</td>
           <td>${it.duration}</td>
@@ -1493,25 +1845,9 @@
    * Returns { cell, text } or null.
    */
   function findStripCellForDay(targetDay) {
-    const allCells = getVisibleCalendarCells();
-    // Prefer the smallest cell that matches (the inner element, not the outer container)
-    let bestMatch = null;
-    let bestArea = Infinity;
-    for (const cell of allCells) {
-      const text = normalizeText(cell.innerText);
-      // Match "SAT 28" or "TUE 01" anywhere in the text (cell text may start with
-      // full day name like "Saturday 28 November SAT 28 75,000")
-      const dayMatch = text.match(/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i);
-      if (dayMatch && Number(dayMatch[1]) === targetDay) {
-        const rect = cell.getBoundingClientRect();
-        const area = rect.width * rect.height;
-        if (area < bestArea) {
-          bestArea = area;
-          bestMatch = { cell, text };
-        }
-      }
-    }
-    return bestMatch;
+    const allCells = getOrderedStripCells();
+    const found = allCells.find((entry) => entry.day === targetDay);
+    return found ? { cell: found.cell, text: found.text } : null;
   }
 
   /**
@@ -1611,135 +1947,265 @@
     return true;
   }
 
+  function saveRunAndRender(run) {
+    saveRun(run);
+    renderResults();
+  }
+
+  function hasCompletedCabinRange(run, cabinCode) {
+    for (let offset = 0; offset < run.days; offset += 1) {
+      const dateText = addDays(run.startDate, offset);
+      if (!hasRunResult(run, dateText, cabinCode)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function markVisibleUnavailableDates(run, cabinCode, baseDateText) {
+    const snapshot = getVisibleStripSnapshot(baseDateText);
+    let added = 0;
+    for (const entry of snapshot) {
+      if (!entry.date || !isDateWithinRun(run, entry.date) || !entry.unavailable) {
+        continue;
+      }
+      if (hasRunResult(run, entry.date, cabinCode)) {
+        continue;
+      }
+      console.log("[CX Helper] Marking strip date as unavailable:", entry.date, cabinCode, entry.text);
+      upsertRunResult(run, buildUnavailableResult(entry.date, cabinCode));
+      added += 1;
+    }
+    if (added > 0) {
+      saveRunAndRender(run);
+    }
+    return snapshot;
+  }
+
+  async function clickStripSnapshotEntry(entry) {
+    console.log("[CX Helper] Clicking strip entry for", entry.date, "text:", entry.text);
+    forceClick(entry.cell);
+    const inner = entry.cell.querySelector("button, a, [role='button']");
+    if (inner) {
+      forceClick(inner);
+    }
+    await sleep(2000);
+    await waitForFlightCards(12000);
+  }
+
+  async function collectResultsForCurrentDate(run, dateText) {
+    const selectedCabins = getRunCabinCodes(run);
+    const seedCabin = getSeedCabin(run);
+    let currentCabin = seedCabin;
+    const attemptedCabins = new Set();
+
+    if (!hasRunResult(run, dateText, seedCabin)) {
+      let result;
+      try {
+        result = await inspectCurrentResults(run, dateText, seedCabin);
+      } catch (error) {
+        console.log("[CX Helper] inspectCurrentResults error for", dateText, seedCabin, error.message);
+        result = buildUnavailableResult(dateText, seedCabin);
+      }
+      upsertRunResult(run, result);
+      saveRunAndRender(run);
+      console.log("[CX Helper] Saved seed cabin result:", dateText, seedCabin, result.available ? result.itineraries.length + " flights" : "unavailable");
+    }
+
+    while (!shouldStop()) {
+      const visibleCabinTiles = findVisibleCabinTiles();
+      const nextCabin = selectedCabins.find((code) =>
+        code !== currentCabin &&
+        !hasRunResult(run, dateText, code) &&
+        visibleCabinTiles.has(code) &&
+        !attemptedCabins.has(code)
+      );
+      if (!nextCabin) {
+        break;
+      }
+      const cabinCode = nextCabin;
+      attemptedCabins.add(cabinCode);
+      if (shouldStop()) {
+        return;
+      }
+      const switched = await selectCabinOnResults(cabinCode, currentCabin);
+      if (!switched) {
+        continue;
+      }
+      currentCabin = cabinCode;
+      let result;
+      try {
+        result = await inspectCurrentResults(run, dateText, cabinCode);
+      } catch (error) {
+        console.log("[CX Helper] inspectCurrentResults error for extra cabin", dateText, cabinCode, error.message);
+        result = buildUnavailableResult(dateText, cabinCode);
+      }
+      upsertRunResult(run, result);
+      saveRunAndRender(run);
+      console.log("[CX Helper] Saved extra cabin result:", dateText, cabinCode, result.available ? result.itineraries.length + " flights" : "unavailable");
+    }
+
+    if (currentCabin !== seedCabin) {
+      const restored = await selectCabinOnResults(seedCabin, currentCabin);
+      if (restored) {
+        console.log("[CX Helper] Restored seed cabin on results page:", seedCabin);
+      }
+    }
+  }
+
+  function hasPendingVisibleCabinResults(run, dateText) {
+    const visibleCabinTiles = findVisibleCabinTiles();
+    return getRunCabinCodes(run).some((cabinCode) => {
+      if (hasRunResult(run, dateText, cabinCode)) {
+        return false;
+      }
+      return cabinCode === getSeedCabin(run) || visibleCabinTiles.has(cabinCode);
+    });
+  }
+
+  function getActiveSnapshotEntry(snapshot, preferredDate) {
+    if (!Array.isArray(snapshot) || snapshot.length === 0) {
+      return null;
+    }
+    return snapshot.find((entry) => entry.selected && entry.date) ||
+      snapshot.find((entry) => entry.date === preferredDate) ||
+      null;
+  }
+
+  async function processSeedCabinFromResultsPage(run) {
+    const seedCabin = getSeedCabin(run);
+    const targetDate = addDays(run.startDate, run.offset || 0);
+    let currentFocusDate = targetDate;
+    let windowMoves = 0;
+
+    setStatus(`Checking ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)} (${Math.max(1, getDateOffset(run, targetDate) + 1)}/${run.days})...`);
+
+    try {
+      await waitForResultsPageReady(20000);
+      await dismissNoAvailabilityModalIfPresent();
+      const dateStatus = await ensureResultsDateSelected(targetDate);
+      if (dateStatus === "unavailable" && !hasRunResult(run, targetDate, seedCabin)) {
+        upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
+        saveRunAndRender(run);
+      }
+    } catch (error) {
+      console.log("[CX Helper] Initial date selection error:", error.message);
+    }
+
+    while (!shouldStop() && windowMoves < 12) {
+      await dismissNoAvailabilityModalIfPresent();
+      const activeDate = getCurrentResultsDate() || currentFocusDate || targetDate;
+      let snapshot = markVisibleUnavailableDates(run, seedCabin, activeDate);
+      if (!snapshot.length) {
+        console.log("[CX Helper] No strip snapshot available on results page");
+        break;
+      }
+      console.log("[CX Helper] Strip snapshot dates:", snapshot.map((entry) => `${entry.date || "?"}${entry.selected ? "*" : ""}${entry.unavailable ? ":NA" : ""}`));
+
+      const activeEntry = getActiveSnapshotEntry(snapshot, currentFocusDate);
+      if (activeEntry && activeEntry.date) {
+        currentFocusDate = activeEntry.date;
+      }
+      console.log("[CX Helper] Active strip focus:", currentFocusDate, activeEntry ? activeEntry.text : "none");
+      if (activeEntry && isDateWithinRun(run, activeEntry.date) && !activeEntry.unavailable && hasPendingVisibleCabinResults(run, activeEntry.date)) {
+        const progress = Math.max(1, getDateOffset(run, activeEntry.date) + 1);
+        setStatus(`Checking ${formatDisplayDate(activeEntry.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
+        await collectResultsForCurrentDate(run, activeEntry.date);
+        snapshot = markVisibleUnavailableDates(run, seedCabin, getCurrentResultsDate() || activeEntry.date);
+      }
+
+      const nextPending = snapshot.find((entry) => entry.date && isDateWithinRun(run, entry.date) && !hasRunResult(run, entry.date, seedCabin));
+      if (nextPending) {
+        console.log("[CX Helper] Next pending date in strip:", nextPending.date, nextPending.text);
+        if (nextPending.unavailable) {
+          upsertRunResult(run, buildUnavailableResult(nextPending.date, seedCabin));
+          saveRunAndRender(run);
+          continue;
+        }
+        const progress = Math.max(1, getDateOffset(run, nextPending.date) + 1);
+        setStatus(`Checking ${formatDisplayDate(nextPending.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
+        await clickStripSnapshotEntry(nextPending);
+        currentFocusDate = nextPending.date;
+        continue;
+      }
+
+      if (hasCompletedCabinRange(run, seedCabin)) {
+        return true;
+      }
+
+      const beforeMax = snapshot.filter((entry) => entry.date).map((entry) => entry.date).sort().slice(-1)[0] || "";
+      const nextArrow = findCalendarNextArrow();
+      if (!nextArrow) {
+        console.log("[CX Helper] No results-page next arrow found for seed cabin", seedCabin);
+        break;
+      }
+      console.log("[CX Helper] Advancing results strip window for seed cabin", seedCabin);
+      clickElement(nextArrow);
+      await sleep(1800);
+      await waitForResultsPageReady(20000);
+      const afterSnapshot = getVisibleStripSnapshot(getCurrentResultsDate() || currentFocusDate || activeDate);
+      const afterMax = afterSnapshot.filter((entry) => entry.date).map((entry) => entry.date).sort().slice(-1)[0] || "";
+      if (beforeMax && afterMax && afterMax <= beforeMax) {
+        console.log("[CX Helper] Results strip did not advance. beforeMax=", beforeMax, "afterMax=", afterMax);
+        break;
+      }
+      const selectedAfterArrow = getActiveSnapshotEntry(afterSnapshot, currentFocusDate);
+      if (selectedAfterArrow && selectedAfterArrow.date) {
+        currentFocusDate = selectedAfterArrow.date;
+      }
+      windowMoves += 1;
+    }
+
+    return hasCompletedCabinRange(run, seedCabin);
+  }
+
   async function continueRunFromResultsPage() {
     const run = loadRun();
     if (!run || !run.active || state.running || !isResultsPage()) {
       return;
     }
-    const targetDate = addDays(run.startDate, run.offset || 0);
     state.running = true;
-    setStatus(`Checking ${formatDisplayDate(targetDate)} (${(run.offset || 0) + 1}/${run.days})...`);
+    const seedCabin = getSeedCabin(run);
+    const targetDate = addDays(run.startDate, run.offset || 0);
     console.log("[CX Helper] === continueRunFromResultsPage: target=", targetDate,
-      "offset=", run.offset, "days=", run.days);
+      "offset=", run.offset, "days=", run.days, "seedCabin=", seedCabin,
+      "cabins=", getRunCabinCodes(run));
 
     try {
-      // Wait for the results page to fully render before doing anything
-      await waitForResultsPageReady(20000);
-      if (shouldStop()) { state.running = false; return; }
-
-      // Navigate to the correct date in the strip
-      let dateStatus;
-      try {
-        dateStatus = await ensureResultsDateSelected(targetDate);
-      } catch (e) {
-        console.log("[CX Helper] ensureResultsDateSelected error:", e.message);
-        dateStatus = "failed";
+      const completedSeed = await processSeedCabinFromResultsPage(run);
+      if (shouldStop()) {
+        state.running = false;
+        return;
       }
-      if (shouldStop()) { state.running = false; return; }
-      console.log("[CX Helper] Date selection status:", dateStatus);
-
-      // Extract flight data
-      let result;
-      if (dateStatus === "unavailable") {
-        result = {
-          date: targetDate,
-          cabin: CABIN_LABELS[run.cabin] || "",
-          itineraries: [],
-          available: false,
-        };
-      } else {
-        // Even if dateStatus is "failed", still try to extract what's visible.
-        // We might be on the right date but just couldn't confirm it.
-        try {
-          result = await inspectCurrentResults(run, targetDate);
-        } catch (e) {
-          console.log("[CX Helper] inspectCurrentResults error:", e.message);
-          result = {
-            date: targetDate,
-            cabin: CABIN_LABELS[run.cabin] || "",
-            itineraries: [],
-            available: false,
-          };
-        }
+      if (completedSeed) {
+        console.log("[CX Helper] Completed results-page pass for seed cabin", seedCabin);
       }
-
-      // Save result and render
-      upsertRunResult(run, result);
-      saveRun(run);
-      renderResults();
-      console.log("[CX Helper] Saved result for", targetDate, ":",
-        result.available ? result.itineraries.length + " flights" : "unavailable");
-
-      // Check if we're done with all days
-      if ((run.offset || 0) + 1 >= run.days) {
+      if (hasFinishedAllResults(run)) {
         run.active = false;
         run.phase = "done";
-        saveRun(run);
-        setStatus(`Finished ${run.results.length} checked day${run.results.length === 1 ? "" : "s"}.`);
+        saveRunAndRender(run);
+        setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
         return;
       }
 
-      if (shouldStop()) { state.running = false; return; }
-
-      // Advance to the next day
-      run.offset = (run.offset || 0) + 1;
-      const nextDate = addDays(run.startDate, run.offset);
-
-      // Try to check the next day directly from the strip (avoid going back to homepage)
-      const nextDay = Number(nextDate.slice(8, 10));
-      const nextCell = findStripCellForDay(nextDay);
-      if (nextCell) {
-        console.log("[CX Helper] Next day", nextDay, "is visible in strip - clicking directly");
-        saveRun(run);
-        setStatus(`Checking ${formatDisplayDate(nextDate)} (${run.offset + 1}/${run.days})...`);
-        forceClick(nextCell.cell);
-        const inner = nextCell.cell.querySelector("button, a, [role='button']");
-        if (inner) forceClick(inner);
-        await sleep(2000);
-        await waitForFlightCards(12000);
-
-        // Now extract for this next date
-        let nextResult;
-        const nextCellText = normalizeText(nextCell.text);
-        if (/Not available/i.test(nextCellText)) {
-          nextResult = { date: nextDate, cabin: CABIN_LABELS[run.cabin] || "", itineraries: [], available: false };
-        } else {
-          try {
-            nextResult = await inspectCurrentResults(run, nextDate);
-          } catch (e) {
-            console.log("[CX Helper] inspectCurrentResults error for next date:", e.message);
-            nextResult = { date: nextDate, cabin: CABIN_LABELS[run.cabin] || "", itineraries: [], available: false };
-          }
-        }
-        upsertRunResult(run, nextResult);
-        saveRun(run);
-        renderResults();
-        console.log("[CX Helper] Saved result for", nextDate, ":",
-          nextResult.available ? nextResult.itineraries.length + " flights" : "unavailable");
-
-        // Check if done after this extra day
-        if (run.offset + 1 >= run.days) {
-          run.active = false;
-          run.phase = "done";
-          saveRun(run);
-          setStatus(`Finished ${run.results.length} checked day${run.results.length === 1 ? "" : "s"}.`);
-          return;
-        }
-
-        if (shouldStop()) { state.running = false; return; }
-
-        // Still more days - go back to homepage for the remaining days
-        run.offset = run.offset + 1;
+      const nextPending = findNextPendingSeed(run);
+      if (!nextPending) {
+        run.active = false;
+        run.phase = "done";
+        saveRunAndRender(run);
+        setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
+        return;
       }
 
-      // Navigate back to homepage for the next date
+      run.offset = nextPending.offset;
+      run.seedCabin = nextPending.cabinCode;
       run.phase = "go-homepage";
-      saveRun(run);
+      saveRunAndRender(run);
       const newSearch = findNewSearchLink();
       if (!newSearch) {
         throw new Error("Could not find Cathay's New search link.");
       }
-      setStatus(`Returning to homepage for ${formatDisplayDate(addDays(run.startDate, run.offset))}...`);
+      setStatus(`Returning to homepage for ${formatDisplayDate(nextPending.dateText)} ${getCabinLabel(nextPending.cabinCode)}...`);
       clickElement(newSearch);
       await sleep(500);
       await confirmLeavePageIfPresent();
@@ -1760,6 +2226,7 @@
       settings.origin = normalizeAirportCode(settings.origin);
       settings.destination = normalizeAirportCode(settings.destination);
       settings.startDate = normalizeDate(settings.startDate);
+      settings.cabins = getRunCabinCodes(settings);
       saveSettings(settings);
     } catch (error) {
       setStatus(`Stopped: ${error.message}`);
@@ -1773,7 +2240,8 @@
       startDate: settings.startDate,
       days: settings.days,
       adults: settings.adults,
-      cabin: settings.cabin,
+      cabinCodes: settings.cabins,
+      seedCabin: settings.cabins[0],
       directOnly: settings.directOnly,
       delayMs: (settings.delayS || DEFAULT_DELAY_S) * 1000,
       origin: settings.origin,
@@ -2145,6 +2613,13 @@
       setStatus("Stopped: Start from Cathay's homepage booking form.");
       return;
     }
+    const pending = findNextPendingSeed(run);
+    if (pending) {
+      run.offset = pending.offset;
+      run.seedCabin = pending.cabinCode;
+      saveRunAndRender(run);
+    }
+    const seedCabin = getSeedCabin(run);
     setStatus("Enabling Book with miles...");
     const milesReady = await ensureMilesToggleOn();
     console.log("[CX Helper] ensureMilesToggleOn returned:", milesReady);
@@ -2153,18 +2628,18 @@
       return;
     }
     // Set cabin class and passenger count
-    if (run.cabin || run.adults > 1) {
-      setStatus("Setting cabin and passengers...");
+    if (seedCabin || run.adults > 1) {
+      setStatus(`Setting cabin and passengers (${getCabinLabel(seedCabin)})...`);
       try {
-        await setHomepageCabinAndPassengers(run.cabin, run.adults || 1);
+        await setHomepageCabinAndPassengers(seedCabin, run.adults || 1);
       } catch (e) {
         console.log("[CX Helper] setHomepageCabinAndPassengers error (non-fatal):", e.message);
       }
     }
 
     const targetDate = addDays(run.startDate, run.offset || 0);
-    setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)}...`);
-    console.log("[CX Helper] About to set homepage date to:", targetDate);
+    setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)} for ${getCabinLabel(seedCabin)}...`);
+    console.log("[CX Helper] About to set homepage date to:", targetDate, "seedCabin:", seedCabin);
     const dateReady = await setHomepageDepartingDate(targetDate);
     console.log("[CX Helper] setHomepageDepartingDate returned:", dateReady);
     if (!dateReady) {
@@ -2178,9 +2653,8 @@
       return;
     }
     run.phase = "await-results";
-    saveRun(run);
-    renderResults();
-    setStatus(`Opening Cathay results for ${formatDisplayDate(targetDate)}...`);
+    saveRunAndRender(run);
+    setStatus(`Opening Cathay results for ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)}...`);
     clickElement(searchButton);
   }
 
@@ -2260,6 +2734,32 @@
     clearRun();
     renderResults();
     setStatus('Cleared. Set your route on Cathay\'s homepage, then click Search date range.');
+  }
+
+  async function onCopyLogsClick() {
+    const text = state.logs.join("\n");
+    if (!text) {
+      setStatus("No debug logs yet.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("Copied debug logs.");
+    } catch (error) {
+      setStatus("Copy failed. Select logs manually.");
+      const el = document.getElementById("cxah-debug-log");
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    }
+  }
+
+  function onClearLogsClick() {
+    state.logs = [];
+    savePersistedLogs([]);
+    renderDebugLog();
+    setStatus("Cleared debug logs.");
   }
 
   function ensureStyles() {
@@ -2403,6 +2903,33 @@
         font-size: 13px;
         color: #f3f0e8;
       }
+      #${PANEL_ID} .cxah-cabin-group {
+        grid-column: 1 / -1;
+      }
+      #${PANEL_ID} .cxah-cabin-options {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      #${PANEL_ID} .cxah-cabin-option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border: 1px solid #59716c;
+        border-radius: 8px;
+        background: #152325;
+      }
+      #${PANEL_ID} .cxah-cabin-option input[type="checkbox"] {
+        width: auto;
+        margin: 0;
+        accent-color: #34827b;
+      }
+      #${PANEL_ID} .cxah-cabin-option label {
+        margin: 0;
+        font-size: 12px;
+        color: #f3f0e8;
+      }
       #${PANEL_ID} table {
         width: calc(100% - 28px);
         margin: 0 14px 14px;
@@ -2422,6 +2949,50 @@
         color: #9fb6b0;
         font-size: 11px;
       }
+      #${PANEL_ID} .cxah-debug {
+        margin: 0 14px 14px;
+        border: 1px solid #2f4946;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+        overflow: hidden;
+      }
+      #${PANEL_ID} .cxah-debug-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        border-bottom: 1px solid #2f4946;
+      }
+      #${PANEL_ID} .cxah-debug-head strong {
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #d8e8e4;
+      }
+      #${PANEL_ID} .cxah-debug-actions {
+        display: flex;
+        gap: 6px;
+      }
+      #${PANEL_ID} .cxah-debug-actions button {
+        width: auto;
+        padding: 5px 8px;
+        font-size: 11px;
+        border-radius: 6px;
+      }
+      #${PANEL_ID} #cxah-debug-log {
+        width: 100%;
+        min-height: 140px;
+        max-height: 220px;
+        resize: vertical;
+        border: 0;
+        border-radius: 0;
+        padding: 10px;
+        background: #0f1a1b;
+        color: #d8e8e4;
+        font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        white-space: pre;
+      }
     `;
     document.documentElement.appendChild(style);
   }
@@ -2440,6 +3011,8 @@
     const panel = document.createElement("section");
     panel.id = PANEL_ID;
     const delayVal = settings.delayS || DEFAULT_DELAY_S;
+    const selectedCabins = getRunCabinCodes(settings);
+    const cabinIds = getCabinCheckboxIds();
     panel.innerHTML = `
       <div class="cxah-head">
         <span>Cathay Award Helper</span>
@@ -2448,8 +3021,8 @@
       <div id="cxah-body">
         <div class="cxah-steps">
           <div>1. Log in to your Cathay account and set your route &amp; trip type on the homepage.</div>
-          <div>2. Fill in start date, cabin, and days below.</div>
-          <div>3. Click "Search date range" - the script does the rest.</div>
+          <div>2. Fill in start date, cabin(s), and days below.</div>
+          <div>3. Click "Search date range" and use the browser console to debug with the script logs if needed.</div>
           <div class="cxah-seed-meta">${run && run.active ? `Active run started ${new Date(run.startedAt).toLocaleString()}` : ""}</div>
         </div>
         <div class="cxah-grid">
@@ -2459,14 +3032,26 @@
               ${buildOptions(ROUTE_PRESETS, settings.routePreset || "")}
             </select>
           </div>
-          <div>
-            <label for="cxah-cabin">Cabin</label>
-            <select id="cxah-cabin">
-              <option value="Y" ${settings.cabin === "Y" ? "selected" : ""}>Economy</option>
-              <option value="PY" ${settings.cabin === "PY" ? "selected" : ""}>Premium Economy</option>
-              <option value="J" ${settings.cabin === "J" ? "selected" : ""}>Business</option>
-              <option value="F" ${settings.cabin === "F" ? "selected" : ""}>First</option>
-            </select>
+          <div class="cxah-cabin-group">
+            <label>Cabins</label>
+            <div class="cxah-cabin-options">
+              <div class="cxah-cabin-option">
+                <input id="${cabinIds.Y}" type="checkbox" ${selectedCabins.includes("Y") ? "checked" : ""} />
+                <label for="${cabinIds.Y}">Economy</label>
+              </div>
+              <div class="cxah-cabin-option">
+                <input id="${cabinIds.PY}" type="checkbox" ${selectedCabins.includes("PY") ? "checked" : ""} />
+                <label for="${cabinIds.PY}">Premium Economy</label>
+              </div>
+              <div class="cxah-cabin-option">
+                <input id="${cabinIds.J}" type="checkbox" ${selectedCabins.includes("J") ? "checked" : ""} />
+                <label for="${cabinIds.J}">Business</label>
+              </div>
+              <div class="cxah-cabin-option">
+                <input id="${cabinIds.F}" type="checkbox" ${selectedCabins.includes("F") ? "checked" : ""} />
+                <label for="${cabinIds.F}">First</label>
+              </div>
+            </div>
           </div>
           <div>
             <label for="cxah-origin">Origin</label>
@@ -2509,6 +3094,7 @@
           <thead>
             <tr>
               <th>Date</th>
+              <th>Cabin</th>
               <th>Flight</th>
               <th>Time</th>
               <th>Dur.</th>
@@ -2517,7 +3103,17 @@
           </thead>
           <tbody></tbody>
         </table>
-        <div class="cxah-note">Best-effort: drives Cathay's visible UI. Refresh if stuck.</div>
+        <div class="cxah-debug">
+          <div class="cxah-debug-head">
+            <strong>Debug Log</strong>
+            <div class="cxah-debug-actions">
+              <button type="button" id="cxah-copy-logs">Copy logs</button>
+              <button type="button" id="cxah-clear-logs" style="background:#4c5f5b;">Clear logs</button>
+            </div>
+          </div>
+          <textarea id="cxah-debug-log" readonly placeholder="Live [CX Helper] logs will appear here."></textarea>
+        </div>
+        <div class="cxah-note">Best-effort: drives Cathay's visible UI and logs detailed strategies in the console for live debugging.</div>
       </div>
     `;
 
@@ -2527,10 +3123,13 @@
     panel.querySelector("#cxah-save-defaults").addEventListener("click", onSaveDefaultsClick);
     panel.querySelector("#cxah-reset-defaults").addEventListener("click", onResetDefaultsClick);
     panel.querySelector("#cxah-clear-run").addEventListener("click", onClearRunClick);
+    panel.querySelector("#cxah-copy-logs").addEventListener("click", onCopyLogsClick);
+    panel.querySelector("#cxah-clear-logs").addEventListener("click", onClearLogsClick);
     panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
     panel.querySelector("#cxah-collapse").addEventListener("click", toggleCollapse);
     makeDraggable(panel, panel.querySelector(".cxah-head"));
     renderResults();
+    renderDebugLog();
   }
 
   function makeDraggable(panel, handle) {
@@ -2573,6 +3172,8 @@
   }
 
   function boot() {
+    state.logs = loadPersistedLogs();
+    ensureLogBridge();
     const mount = async () => {
       ensurePanel();
       renderResults();
@@ -2602,8 +3203,18 @@
         return;
       }
 
-      if (run.phase === "await-results" && isResultsPage()) {
-        continueRunFromResultsPage();
+      if (run.phase === "await-results") {
+        for (let wait = 0; wait < 20; wait++) {
+          if (isResultsPage()) {
+            console.log("[CX Helper] Results page detected on attempt", wait);
+            continueRunFromResultsPage();
+            return;
+          }
+          console.log("[CX Helper] Waiting for results page to load... attempt", wait);
+          await sleep(1500);
+        }
+        console.log("[CX Helper] Results page never became detectable during await-results phase");
+        setStatus("Waiting for Cathay results page...");
         return;
       }
 

@@ -73,6 +73,9 @@ Available cabin values:
 - Each cell contains text like `MON 15` or `TUE 16`
 - Match with regex: `/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i`
 - Capture group 1 gives the day number
+- The strip can be treated as a **mini week view**: once you know the currently selected full date, the cells to the left/right represent contiguous dates
+- Cells showing **`Not available`** can be recorded immediately for the current seed cabin without clicking into each one
+- When the user requested a date range, prefer harvesting the whole visible strip before falling back to a new homepage search
 
 ### Navigation arrows
 
@@ -80,6 +83,7 @@ Available cabin values:
 - Require `forceClick` (PointerEvent sequence)
 - After clicking, wait for the calendar strip to re-render before reading new dates
 - **Month boundaries**: When advancing past the last day of a month, the strip loads the next month. Detect this by checking if target day appears after navigation.
+- On the results page, the **right arrow should be treated as the primary way to continue scanning later dates** in the requested range
 
 ## Flight Results Parsing
 
@@ -117,6 +121,11 @@ Since the agent cannot see the live browser, the debugging loop is:
 2. **Try multiple approaches in parallel** within the same code — label each strategy (A/B/C/D) in logs
 3. **Ask the user to paste console output** back — this is your primary feedback channel
 4. **Consolidate** once you identify what works — remove the failed strategies and keep the winner
+
+This is especially important for:
+- **Results-page cabin toggles** where the next cabin may only appear after clicking the current one
+- **Results-page date arrows** where the correct arrow or click method can vary
+- **Strip-cell selection** where a container and its inner button can both be clickable candidates
 
 ### What to log
 
