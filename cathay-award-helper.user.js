@@ -3,7 +3,8 @@
 // @namespace    codex.local
 // @version      0.2.0
 // @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
-// @author       Codex
+// @author       jiahongc
+// @license      MIT
 // @match        https://www.cathaypacific.com/cx/en_US.html
 // @match        https://*.cathaypacific.com/*
 // @match        https://book.cathaypacific.com/*

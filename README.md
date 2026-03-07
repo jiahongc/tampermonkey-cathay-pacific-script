@@ -13,6 +13,12 @@ A Tampermonkey userscript that automates Cathay Pacific award flight searches ac
 
 ## Installation
 
+### From Greasy Fork (recommended)
+
+Install directly from [Greasy Fork](https://greasyfork.org/en/scripts/568672-cathay-award-helper).
+
+### Manual
+
 1. Install [Tampermonkey](https://www.tampermonkey.net/) browser extension
 2. Create a new userscript in Tampermonkey
 3. Copy the contents of `cathay-award-helper.user.js` into the editor
