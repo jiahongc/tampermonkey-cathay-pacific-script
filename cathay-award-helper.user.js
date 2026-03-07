@@ -25,6 +25,7 @@
   const MAX_LOG_LINES = 250;
   const MAX_DAYS = 14;
   const DEFAULT_DELAY_S = 2;
+  const HOMEPAGE_URL = "https://www.cathaypacific.com/cx/en_US.html";
   const CABIN_CODES = ["Y", "PY", "J", "F"];
   const DEFAULT_SETTINGS = {
     routePreset: "JFK-HKG",
@@ -116,7 +117,61 @@
   }
 
   function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    const total = Math.max(0, Number(ms) || 0);
+    if (total <= 250) {
+      return new Promise((resolve) => setTimeout(resolve, total));
+    }
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const tick = () => {
+        if (shouldStop()) {
+          resolve();
+          return;
+        }
+        const elapsed = Date.now() - started;
+        if (elapsed >= total) {
+          resolve();
+          return;
+        }
+        setTimeout(tick, Math.min(250, total - elapsed));
+      };
+      setTimeout(tick, Math.min(250, total));
+    });
+  }
+
+  function getRunDelayMs(run, multiplier, minimumMs) {
+    const base = Math.max(DEFAULT_DELAY_S * 1000, Number(run && run.delayMs) || 0);
+    return Math.max(minimumMs || 0, Math.round(base * (multiplier || 1)));
+  }
+
+  function armRunCooldown(run, waitMs, reason) {
+    if (!run || !waitMs) {
+      return;
+    }
+    run.cooldownUntil = Date.now() + waitMs;
+    saveRun(run);
+    console.log("[CX Helper] Armed cooldown:", Math.ceil(waitMs / 1000), "s", reason || "");
+  }
+
+  async function waitForRunCooldown(run, statusMessage) {
+    if (!run || !run.cooldownUntil) {
+      return;
+    }
+    let remaining = Number(run.cooldownUntil) - Date.now();
+    if (remaining <= 0) {
+      delete run.cooldownUntil;
+      saveRun(run);
+      return;
+    }
+    const message = statusMessage || `Cooling down for ${Math.ceil(remaining / 1000)}s before the next Cathay request...`;
+    console.log("[CX Helper] Cooldown active:", Math.ceil(remaining / 1000), "s");
+    setStatus(message);
+    while (remaining > 0 && !shouldStop()) {
+      await sleep(Math.min(remaining, 1000));
+      remaining = Number(run.cooldownUntil) - Date.now();
+    }
+    delete run.cooldownUntil;
+    saveRun(run);
   }
 
   function loadSettings() {
@@ -148,6 +203,21 @@
     delete merged.delayMs;
     delete merged.cabinPreset; // removed field
     return merged;
+  }
+
+  function getPanelSettingsSource() {
+    const run = loadRun();
+    if (run && run.active) {
+      const merged = Object.assign({}, loadSettings(), run.settings || {});
+      if (run.delayMs) {
+        merged.delayS = Math.max(1, Math.round(run.delayMs / 1000));
+      }
+      if (Array.isArray(run.cabinCodes) && run.cabinCodes.length) {
+        merged.cabins = run.cabinCodes.slice();
+      }
+      return merged;
+    }
+    return loadSettings();
   }
 
   function saveSettings(settings) {
@@ -289,7 +359,14 @@
     if (!label || !normalized) {
       return false;
     }
-    return new RegExp(`^${escapeRegExp(label)}(?:\\b|\\s|$)`, "i").test(normalized);
+    const exact = new RegExp(`^${escapeRegExp(label)}(?:\\s+class)?$`, "i");
+    const priced = new RegExp(`^${escapeRegExp(label)}(?:\\s+class)?\\s+from\\b`, "i");
+    if (exact.test(normalized) || priced.test(normalized)) {
+      return true;
+    }
+    return normalized.length <= 40 &&
+      new RegExp(`^${escapeRegExp(label)}(?:\\s+class)?\\b`, "i").test(normalized) &&
+      /(?:A\s*\d{2,3}[,.]?\d{3}|\d{2,3}[,.]?\d{3})/.test(normalized);
   }
 
   function normalizeCabinCodes(input) {
@@ -442,6 +519,9 @@
   }
 
   function clickElement(el) {
+    if (!el || shouldStop()) {
+      return;
+    }
     const target = el.closest("button, a, label, [role='button'], [tabindex]") || el;
     // Use full pointer+mouse+click sequence for React Aria compatibility
     forceClick(target);
@@ -471,6 +551,48 @@
     return isResultsLikePage();
   }
 
+  function isRecoverableErrorPage() {
+    const text = document.body ? document.body.innerText : "";
+    return (/^Error$/m.test(text) || /\bError\b/.test(text)) &&
+      (/system is already processing a request from you/i.test(text) || /\(3002\)/.test(text));
+  }
+
+  async function recoverFromErrorPage(run) {
+    if (!isRecoverableErrorPage()) {
+      return false;
+    }
+    const dateText = addDays(run.startDate, run.offset || 0);
+    const cabinCode = getSeedCabin(run);
+    const retryKey = `${dateText}__${cabinCode}`;
+    run.errorRecoveries = run.errorRecoveries || {};
+    run.errorRecoveries[retryKey] = (run.errorRecoveries[retryKey] || 0) + 1;
+    const retryCount = run.errorRecoveries[retryKey];
+    console.log("[CX Helper] Recoverable Cathay error page detected", "retry=", retryCount, "date=", dateText, "cabin=", cabinCode);
+    if (retryCount >= 2) {
+      console.log("[CX Helper] Repeated recoverable error for", dateText, cabinCode, "- marking unavailable and advancing");
+      if (!hasRunResult(run, dateText, cabinCode)) {
+        upsertRunResult(run, buildUnavailableResult(dateText, cabinCode));
+      }
+      const nextPending = findNextPendingSeed(run);
+      if (!nextPending) {
+        run.active = false;
+        run.phase = "done";
+        saveRunAndRender(run);
+        setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
+        window.location.assign(HOMEPAGE_URL);
+        return true;
+      }
+      run.offset = nextPending.offset;
+      run.seedCabin = nextPending.cabinCode;
+    }
+    run.phase = "go-homepage";
+    armRunCooldown(run, getRunDelayMs(run, 5, 10000), "recovering from Cathay error page");
+    saveRun(run);
+    setStatus("Recovering from Cathay error page...");
+    window.location.assign(HOMEPAGE_URL);
+    return true;
+  }
+
   function hasMilesToggleEnabled() {
     const text = document.body ? document.body.innerText : "";
     return /Redeem flights/.test(text);
@@ -485,6 +607,16 @@
 
   function findNewSearchLink() {
     return findClickableByText(/^New search$/i);
+  }
+
+  function navigateToHomepage(run, reason) {
+    if (run) {
+      run.phase = "go-homepage";
+      saveRunAndRender(run);
+    }
+    console.log("[CX Helper] Navigating directly to homepage", reason || "");
+    setStatus(reason || "Returning to Cathay homepage...");
+    window.location.assign(HOMEPAGE_URL);
   }
 
   function findCheckboxByLabelText(labelRegex) {
@@ -530,6 +662,9 @@
    * Cathay uses a JS framework that may not respond to synthetic MouseEvents.
    */
   function forceClick(el) {
+    if (!el || shouldStop()) {
+      return;
+    }
     const rect = el.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
@@ -799,8 +934,24 @@
     console.log("[CX Helper] Clicking cabin tile for", cabinCode, "text:", tileInfo.text);
     clickElement(tileInfo.el);
     await sleep(1800);
+    if (shouldStop()) {
+      return false;
+    }
     await waitForFlightCards(12000);
-    return true;
+    if (shouldStop()) {
+      return false;
+    }
+    const tilesAfter = findVisibleCabinTiles();
+    const switchedTile = tilesAfter.get(cabinCode);
+    const previousTile = currentCabinCode ? tilesAfter.get(currentCabinCode) : null;
+    if (switchedTile && switchedTile.active) {
+      return true;
+    }
+    if (previousTile && !previousTile.active) {
+      return true;
+    }
+    console.log("[CX Helper] Cabin tile switch for", cabinCode, "did not verify as active; skipping cabin reuse");
+    return false;
   }
 
   function getVisibleCalendarCells() {
@@ -1449,6 +1600,40 @@
     return hitsA.length >= hitsB.length ? hitsA : hitsB;
   }
 
+  function extractFallbackMilesFromVisibleResults() {
+    const stripCells = getOrderedStripCells();
+    const selectedCell = stripCells.find((entry) => entry.selected);
+    const selectedText = normalizeText(selectedCell ? selectedCell.text : "");
+    const selectedMatch = selectedText.match(/(\d{2,3}[,.]?\d{3})/);
+    if (selectedMatch) {
+      return Number(selectedMatch[1].replace(/[,.]/g, "")).toLocaleString();
+    }
+
+    for (const tile of findVisibleCabinTiles().values()) {
+      const text = normalizeText(tile && tile.text);
+      const match = text.match(/(\d{2,3}[,.]?\d{3})/);
+      if (match) {
+        return Number(match[1].replace(/[,.]/g, "")).toLocaleString();
+      }
+    }
+    return "";
+  }
+
+  function applyFallbackMiles(itineraries) {
+    if (!Array.isArray(itineraries) || !itineraries.length) {
+      return itineraries;
+    }
+    if (itineraries.some((item) => item.miles)) {
+      return itineraries;
+    }
+    const fallbackMiles = extractFallbackMilesFromVisibleResults();
+    if (!fallbackMiles) {
+      return itineraries;
+    }
+    console.log("[CX Helper] Applying fallback miles from visible results:", fallbackMiles);
+    return itineraries.map((item) => Object.assign({}, item, { miles: fallbackMiles }));
+  }
+
   function hasNoRedemptionSeatsText(text) {
     return /There are no redemption seats available for this flight/i.test(String(text || ""));
   }
@@ -1641,6 +1826,10 @@
     const deadline = Date.now() + (totalWait - minWaitMs);
     let foundOnce = false;
     while (Date.now() < deadline) {
+      if (shouldStop()) {
+        console.log("[CX Helper] waitForFlightCards aborted because run stopped");
+        return false;
+      }
       // Check if any CX flight numbers with times are visible
       // Use full body text as primary check (more reliable than individual element scanning)
       const bodyText = document.body ? document.body.innerText : "";
@@ -1693,6 +1882,9 @@
 
     // Wait for flight cards to render after page load / date change
     await waitForFlightCards(15000);
+    if (shouldStop()) {
+      return noAvail;
+    }
 
     if (await dismissNoAvailabilityModalIfPresent()) {
       console.log("[CX Helper] Dismissed no-availability modal for", dateText, cabinCode);
@@ -1719,7 +1911,7 @@
     // Don't check cabin - it's already set from homepage search.
     // Don't check for "no flights" message here - just go straight to extraction.
 
-    const itineraries = parseVisibleItineraries();
+    const itineraries = applyFallbackMiles(parseVisibleItineraries());
     if (itineraries.length === 0) {
       // Extra diagnostics: dump the page text around CX references
       const allText = document.body ? document.body.innerText : "";
@@ -1765,6 +1957,9 @@
       return cabinSortValue(a.cabinCode) - cabinSortValue(b.cabinCode);
     });
     run.results = next;
+    if (run && run.errorRecoveries && result && result.date && result.cabinCode) {
+      delete run.errorRecoveries[`${result.date}__${result.cabinCode}`];
+    }
   }
 
   function findNextPendingSeed(run) {
@@ -1900,6 +2095,9 @@
     console.log("[CX Helper] Clicking strip day", targetDay);
     forceClick(found.cell);
     await sleep(2000);
+    if (shouldStop()) {
+      return "failed";
+    }
 
     // Also try clicking the inner button/link if the cell is a container
     const inner = found.cell.querySelector("button, a, [role='button']");
@@ -1907,6 +2105,9 @@
       console.log("[CX Helper] Also clicking inner element:", inner.tagName);
       forceClick(inner);
       await sleep(1000);
+      if (shouldStop()) {
+        return "failed";
+      }
     }
 
     // Wait for flight content to load/update after clicking the day
@@ -1923,6 +2124,10 @@
 
     const deadline = Date.now() + (maxWaitMs || 20000);
     while (Date.now() < deadline) {
+      if (shouldStop()) {
+        console.log("[CX Helper] waitForResultsPageReady aborted because run stopped");
+        return false;
+      }
       // Check if the calendar strip is rendered (has day cells with day numbers)
       const cells = getVisibleCalendarCells();
       const hasDayCells = cells.some((c) => /\b\d{1,2}\b/.test(normalizeText(c.innerText)));
@@ -1982,14 +2187,17 @@
     return snapshot;
   }
 
-  async function clickStripSnapshotEntry(entry) {
+  async function clickStripSnapshotEntry(entry, run) {
     console.log("[CX Helper] Clicking strip entry for", entry.date, "text:", entry.text);
     forceClick(entry.cell);
     const inner = entry.cell.querySelector("button, a, [role='button']");
     if (inner) {
       forceClick(inner);
     }
-    await sleep(2000);
+    await sleep(getRunDelayMs(run, 1.5, 2500));
+    if (shouldStop()) {
+      return;
+    }
     await waitForFlightCards(12000);
   }
 
@@ -2082,11 +2290,17 @@
 
     try {
       await waitForResultsPageReady(20000);
-      await dismissNoAvailabilityModalIfPresent();
-      const dateStatus = await ensureResultsDateSelected(targetDate);
-      if (dateStatus === "unavailable" && !hasRunResult(run, targetDate, seedCabin)) {
+      const dismissedInitialModal = await dismissNoAvailabilityModalIfPresent();
+      if (dismissedInitialModal && !hasRunResult(run, targetDate, seedCabin)) {
         upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
         saveRunAndRender(run);
+      }
+      if (!dismissedInitialModal) {
+        const dateStatus = await ensureResultsDateSelected(targetDate);
+        if (dateStatus === "unavailable" && !hasRunResult(run, targetDate, seedCabin)) {
+          upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
+          saveRunAndRender(run);
+        }
       }
     } catch (error) {
       console.log("[CX Helper] Initial date selection error:", error.message);
@@ -2124,7 +2338,7 @@
         }
         const progress = Math.max(1, getDateOffset(run, nextPending.date) + 1);
         setStatus(`Checking ${formatDisplayDate(nextPending.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
-        await clickStripSnapshotEntry(nextPending);
+        await clickStripSnapshotEntry(nextPending, run);
         currentFocusDate = nextPending.date;
         continue;
       }
@@ -2141,7 +2355,7 @@
       }
       console.log("[CX Helper] Advancing results strip window for seed cabin", seedCabin);
       clickElement(nextArrow);
-      await sleep(1800);
+      await sleep(getRunDelayMs(run, 1.25, 2200));
       await waitForResultsPageReady(20000);
       const afterSnapshot = getVisibleStripSnapshot(getCurrentResultsDate() || currentFocusDate || activeDate);
       const afterMax = afterSnapshot.filter((entry) => entry.date).map((entry) => entry.date).sort().slice(-1)[0] || "";
@@ -2201,14 +2415,9 @@
       run.seedCabin = nextPending.cabinCode;
       run.phase = "go-homepage";
       saveRunAndRender(run);
-      const newSearch = findNewSearchLink();
-      if (!newSearch) {
-        throw new Error("Could not find Cathay's New search link.");
-      }
       setStatus(`Returning to homepage for ${formatDisplayDate(nextPending.dateText)} ${getCabinLabel(nextPending.cabinCode)}...`);
-      clickElement(newSearch);
-      await sleep(500);
-      await confirmLeavePageIfPresent();
+      armRunCooldown(run, getRunDelayMs(run, 2.5, 5000), "returning to homepage for the next seed search");
+      navigateToHomepage(run, `Returning to homepage for ${formatDisplayDate(nextPending.dateText)} ${getCabinLabel(nextPending.cabinCode)}...`);
     } catch (error) {
       console.log("[CX Helper] continueRunFromResultsPage FATAL error:", error.message, error.stack);
       run.active = false;
@@ -2608,54 +2817,79 @@
   }
 
   async function launchHomepageSearchForRun(run) {
+    if (state.running) {
+      console.log("[CX Helper] launchHomepageSearchForRun skipped because another automation step is already running");
+      return;
+    }
+    state.running = true;
     console.log("[CX Helper] launchHomepageSearchForRun: starting, isHomepage=", isHomepage());
-    if (!isHomepage()) {
-      setStatus("Stopped: Start from Cathay's homepage booking form.");
-      return;
-    }
-    const pending = findNextPendingSeed(run);
-    if (pending) {
-      run.offset = pending.offset;
-      run.seedCabin = pending.cabinCode;
-      saveRunAndRender(run);
-    }
-    const seedCabin = getSeedCabin(run);
-    setStatus("Enabling Book with miles...");
-    const milesReady = await ensureMilesToggleOn();
-    console.log("[CX Helper] ensureMilesToggleOn returned:", milesReady);
-    if (!milesReady) {
-      setStatus('Stopped: Could not turn on "Book with miles" automatically.');
-      return;
-    }
-    // Set cabin class and passenger count
-    if (seedCabin || run.adults > 1) {
-      setStatus(`Setting cabin and passengers (${getCabinLabel(seedCabin)})...`);
-      try {
-        await setHomepageCabinAndPassengers(seedCabin, run.adults || 1);
-      } catch (e) {
-        console.log("[CX Helper] setHomepageCabinAndPassengers error (non-fatal):", e.message);
+    try {
+      await waitForRunCooldown(run, "Waiting before the next Cathay search...");
+      if (shouldStop()) {
+        return;
       }
-    }
+      if (!isHomepage()) {
+        setStatus("Stopped: Start from Cathay's homepage booking form.");
+        return;
+      }
+      const pending = findNextPendingSeed(run);
+      if (pending) {
+        run.offset = pending.offset;
+        run.seedCabin = pending.cabinCode;
+        saveRunAndRender(run);
+      }
+      const seedCabin = getSeedCabin(run);
+      setStatus("Enabling Book with miles...");
+      const milesReady = await ensureMilesToggleOn();
+      console.log("[CX Helper] ensureMilesToggleOn returned:", milesReady);
+      if (shouldStop()) {
+        return;
+      }
+      if (!milesReady) {
+        setStatus('Stopped: Could not turn on "Book with miles" automatically.');
+        return;
+      }
+      if (seedCabin || run.adults > 1) {
+        setStatus(`Setting cabin and passengers (${getCabinLabel(seedCabin)})...`);
+        try {
+          await setHomepageCabinAndPassengers(seedCabin, run.adults || 1);
+        } catch (e) {
+          console.log("[CX Helper] setHomepageCabinAndPassengers error (non-fatal):", e.message);
+        }
+        if (shouldStop()) {
+          return;
+        }
+      }
 
-    const targetDate = addDays(run.startDate, run.offset || 0);
-    setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)} for ${getCabinLabel(seedCabin)}...`);
-    console.log("[CX Helper] About to set homepage date to:", targetDate, "seedCabin:", seedCabin);
-    const dateReady = await setHomepageDepartingDate(targetDate);
-    console.log("[CX Helper] setHomepageDepartingDate returned:", dateReady);
-    if (!dateReady) {
-      setStatus("Stopped: Could not set Cathay's homepage date.");
-      return;
+      const targetDate = addDays(run.startDate, run.offset || 0);
+      setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)} for ${getCabinLabel(seedCabin)}...`);
+      console.log("[CX Helper] About to set homepage date to:", targetDate, "seedCabin:", seedCabin);
+      const dateReady = await setHomepageDepartingDate(targetDate);
+      console.log("[CX Helper] setHomepageDepartingDate returned:", dateReady);
+      if (shouldStop()) {
+        return;
+      }
+      if (!dateReady) {
+        setStatus("Stopped: Could not set Cathay's homepage date.");
+        return;
+      }
+      const searchButton = findHomepageSearchButton();
+      console.log("[CX Helper] findHomepageSearchButton:", searchButton ? searchButton.tagName + " '" + normalizeText(searchButton.innerText) + "'" : "NOT FOUND");
+      if (!searchButton) {
+        setStatus("Stopped: Could not find Cathay's homepage search button.");
+        return;
+      }
+      run.phase = "await-results";
+      armRunCooldown(run, getRunDelayMs(run, 2, 4000), "submitting Cathay homepage search");
+      saveRunAndRender(run);
+      setStatus(`Opening Cathay results for ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)}...`);
+      if (shouldStop()) {
+        return;
+      }
+      clickElement(searchButton);
+    } finally {
+      state.running = false;
     }
-    const searchButton = findHomepageSearchButton();
-    console.log("[CX Helper] findHomepageSearchButton:", searchButton ? searchButton.tagName + " '" + normalizeText(searchButton.innerText) + "'" : "NOT FOUND");
-    if (!searchButton) {
-      setStatus("Stopped: Could not find Cathay's homepage search button.");
-      return;
-    }
-    run.phase = "await-results";
-    saveRunAndRender(run);
-    setStatus(`Opening Cathay results for ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)}...`);
-    clickElement(searchButton);
   }
 
   async function startRunFromHomepage() {
@@ -2666,17 +2900,10 @@
 
     if (!isHomepage()) {
       if (isResultsPage()) {
-        const newSearch = findNewSearchLink();
-        if (!newSearch) {
-          setStatus("Stopped: Could not find Cathay's New search link.");
-          return;
-        }
         run.phase = "go-homepage";
         saveRun(run);
         setStatus("Returning to Cathay's homepage booking form...");
-        clickElement(newSearch);
-        await sleep(500);
-        await confirmLeavePageIfPresent();
+        navigateToHomepage(run, "Returning to Cathay's homepage booking form...");
         return;
       }
       setStatus("Stopped: Start from Cathay's homepage booking form.");
@@ -2773,8 +3000,10 @@
         position: fixed;
         top: 20px;
         right: 20px;
+        left: auto;
         z-index: 2147483647;
-        width: 420px;
+        width: min(620px, calc(100vw - 40px));
+        max-width: calc(100vw - 40px);
         background: rgba(16, 27, 29, 0.96);
         color: #f3f0e8;
         border: 1px solid #6b8a84;
@@ -2783,6 +3012,11 @@
         font: 13px/1.4 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       #${PANEL_ID} * { box-sizing: border-box; }
+      #${PANEL_ID} #cxah-body {
+        max-height: calc(100vh - 70px);
+        overflow-y: auto;
+        overflow-x: auto;
+      }
       #${PANEL_ID} .cxah-head {
         padding: 12px 14px 8px;
         font-size: 14px;
@@ -2930,11 +3164,26 @@
         font-size: 12px;
         color: #f3f0e8;
       }
-      #${PANEL_ID} table {
-        width: calc(100% - 28px);
+      #${PANEL_ID} .cxah-table-wrap {
         margin: 0 14px 14px;
+        overflow-x: auto;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        max-height: min(260px, 32vh);
+        border-top: 1px solid #2f4946;
+      }
+      #${PANEL_ID} table {
+        width: max-content;
+        min-width: 100%;
+        margin: 0;
         border-collapse: collapse;
         font-size: 12px;
+      }
+      #${PANEL_ID} thead th {
+        position: sticky;
+        top: 0;
+        background: rgba(16, 27, 29, 0.98);
+        z-index: 1;
       }
       #${PANEL_ID} th, #${PANEL_ID} td {
         border-top: 1px solid #2f4946;
@@ -2985,6 +3234,8 @@
         min-height: 140px;
         max-height: 220px;
         resize: vertical;
+        overflow-x: auto;
+        overflow-y: auto;
         border: 0;
         border-radius: 0;
         padding: 10px;
@@ -3002,7 +3253,7 @@
       return;
     }
     ensureStyles();
-    const settings = loadSettings();
+    const settings = getPanelSettingsSource();
     const run = loadRun();
     if (run && Array.isArray(run.results)) {
       state.results = run.results;
@@ -3090,19 +3341,21 @@
           <button type="button" id="cxah-clear-run">Clear current run</button>
         </div>
         <div class="cxah-status">${state.status}</div>
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Cabin</th>
-              <th>Flight</th>
-              <th>Time</th>
-              <th>Dur.</th>
-              <th>Miles</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+        <div class="cxah-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Cabin</th>
+                <th>Flight</th>
+                <th>Time</th>
+                <th>Dur.</th>
+                <th>Miles</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
         <div class="cxah-debug">
           <div class="cxah-debug-head">
             <strong>Debug Log</strong>
@@ -3111,7 +3364,7 @@
               <button type="button" id="cxah-clear-logs" style="background:#4c5f5b;">Clear logs</button>
             </div>
           </div>
-          <textarea id="cxah-debug-log" readonly placeholder="Live [CX Helper] logs will appear here."></textarea>
+          <textarea id="cxah-debug-log" readonly wrap="off" placeholder="Live [CX Helper] logs will appear here."></textarea>
         </div>
         <div class="cxah-note">Best-effort: drives Cathay's visible UI and logs detailed strategies in the console for live debugging.</div>
       </div>
@@ -3180,6 +3433,10 @@
       const run = loadRun();
       if (!run || !run.active) return;
 
+      if (await recoverFromErrorPage(run)) {
+        return;
+      }
+
       console.log("[CX Helper] Boot: phase=", run.phase, "isHomepage=", isHomepage(),
         "isResults=", isResultsPage());
 
@@ -3188,6 +3445,9 @@
         // The "New search" link triggers a full page navigation, so we need to
         // wait for the booking panel to appear.
         for (let wait = 0; wait < 20; wait++) {
+          if (await recoverFromErrorPage(run)) {
+            return;
+          }
           if (isHomepage()) {
             console.log("[CX Helper] Homepage detected on attempt", wait);
             await launchHomepageSearchForRun(run);
@@ -3205,6 +3465,9 @@
 
       if (run.phase === "await-results") {
         for (let wait = 0; wait < 20; wait++) {
+          if (await recoverFromErrorPage(run)) {
+            return;
+          }
           if (isResultsPage()) {
             console.log("[CX Helper] Results page detected on attempt", wait);
             continueRunFromResultsPage();
@@ -3215,6 +3478,10 @@
         }
         console.log("[CX Helper] Results page never became detectable during await-results phase");
         setStatus("Waiting for Cathay results page...");
+        return;
+      }
+
+      if (await recoverFromErrorPage(run)) {
         return;
       }
 

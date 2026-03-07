@@ -13,8 +13,12 @@ A Tampermonkey userscript that automates Cathay Pacific award flight searches ac
 - Advance through later dates with the results-page right arrow instead of restarting from the homepage each time
 - Reuse in-page cabin toggles when a searched cabin exposes additional selected cabins
 - Automatically dismiss the results-page "no available flights for that date" modal and continue scanning
+- Automatically recover from Cathay's transient `Error (3002)` page by returning to the homepage and resuming the run
+- Delay setting now paces homepage submissions, result-page date hops, and adds a longer cooldown after 3002 recovery
 - Dual-strategy flight parsing (DOM-based + text-based) for reliable data extraction
+- Falls back to visible strip/tile pricing when flights parse correctly but miles are missing from the card text
 - Results displayed in a collapsible panel overlay
+- Scrollable results table area with sticky headers for wider result sets
 - Stop button to halt automation at any time
 - Settings saved across page navigations
 - Persistent in-panel debug log with copy/clear controls for live debugging and back-and-forth iteration
@@ -51,7 +55,8 @@ The script automates the Cathay Pacific booking interface by:
 1. **Homepage setup** — Starts from Cathay’s homepage, sets the seed cabin via the custom dropdown, adjusts passenger count, and opens the first result page
 2. **Results-page traversal** — Uses the visible date strip, `Not available` cells, right-arrow pagination, and modal dismissal to cover as much of the requested range as possible without rerunning the search
 3. **Cabin reuse** — If the results page exposes other selected cabins as in-page toggles, it clicks and scrapes them there before falling back to another homepage seed search
-4. **Result extraction** — Parses flight availability using two strategies (DOM-based and text-based) and picks the one with the most complete data
+4. **Recovery** — If Cathay returns its transient request-processing error page, the script returns to the homepage and resumes from there
+5. **Result extraction** — Parses flight availability using two strategies (DOM-based and text-based) and picks the one with the most complete data
 
 For technical details on the website's DOM patterns and interaction methods, see [cathay-website-patterns.md](cathay-website-patterns.md).
 

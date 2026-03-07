@@ -73,9 +73,11 @@ Available cabin values:
 - Each cell contains text like `MON 15` or `TUE 16`
 - Match with regex: `/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i`
 - Capture group 1 gives the day number
+- Cathay often renders **duplicate DOM cells for the same visible date**. Deduplicate by day number and keep the smallest candidate by area.
 - The strip can be treated as a **mini week view**: once you know the currently selected full date, the cells to the left/right represent contiguous dates
 - Cells showing **`Not available`** can be recorded immediately for the current seed cabin without clicking into each one
 - When the user requested a date range, prefer harvesting the whole visible strip before falling back to a new homepage search
+- The top-of-page "current date" header can be blank or stale after strip clicks, so the selected strip cell is usually more reliable than the header text
 
 ### Navigation arrows
 
@@ -108,6 +110,18 @@ if strategyA has more flights with miles → use A
 if strategyB has more flights with miles → use B
 if tied on miles → use whichever has more total flights (A wins ties)
 ```
+
+### Miles fallback
+
+- Some result layouts expose valid nonstop flights in the DOM but omit miles from the parsed card text on the first loaded date
+- In those cases, the visible selected strip cell or the active cabin price tile is a reliable fallback source for the miles figure
+- Apply that fallback only when flights were parsed successfully but every parsed itinerary is missing miles
+
+## Results Page Quirks
+
+- Business or First seed searches may land on a results page that immediately shows the **"There are no available flights for that date"** modal
+- Closing that modal keeps you on the results experience, and the surrounding strip/tile state can still be harvested
+- The results page is therefore the primary workspace; the homepage should mainly be used to seed a new cabin/date when the current page cannot reach it
 
 ## Debugging Methodology
 
