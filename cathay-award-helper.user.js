@@ -22,7 +22,7 @@
   const RUN_KEY = "cx-award-helper-run-v2";
   const WINDOW_NAME_PREFIX = "__cx_award_helper__:";
   const MAX_DAYS = 14;
-  const DEFAULT_DELAY_MS = 2200;
+  const DEFAULT_DELAY_S = 2;
   const DEFAULT_SETTINGS = {
     routePreset: "JFK-HKG",
     origin: "JFK",
@@ -30,10 +30,10 @@
     startDate: "",
     days: 7,
     adults: 1,
-    cabinPreset: "PY",
     cabin: "PY",
     directOnly: true,
-    delayMs: DEFAULT_DELAY_MS,
+    delayS: DEFAULT_DELAY_S,
+    // Legacy compat: delayMs is converted to delayS on load
   };
   const ROUTE_PRESETS = [
     { value: "JFK-HKG", label: "JFK -> HKG", origin: "JFK", destination: "HKG" },
@@ -43,13 +43,6 @@
     { value: "SFO-HKG", label: "SFO -> HKG", origin: "SFO", destination: "HKG" },
     { value: "HKG-SFO", label: "HKG -> SFO", origin: "HKG", destination: "SFO" },
     { value: "", label: "Custom route", origin: "", destination: "" },
-  ];
-  const CABIN_PRESETS = [
-    { value: "Y", label: "Economy", cabin: "Y" },
-    { value: "PY", label: "Premium Economy", cabin: "PY" },
-    { value: "J", label: "Business", cabin: "J" },
-    { value: "F", label: "First", cabin: "F" },
-    { value: "", label: "Keep current cabin", cabin: "" },
   ];
   const CABIN_LABELS = {
     Y: "Economy",
@@ -85,11 +78,17 @@
     // Also check the run object in window.name (survives cross-origin navigation)
     const run = loadRun();
     if (run && run.settings) {
-      // Merge: run.settings wins over localStorage for cross-origin scenarios
       saved = Object.assign({}, saved || {}, run.settings);
     }
 
-    return Object.assign({}, DEFAULT_SETTINGS, saved || {});
+    const merged = Object.assign({}, DEFAULT_SETTINGS, saved || {});
+    // Legacy: convert delayMs to delayS
+    if (merged.delayMs && !merged.delayS) {
+      merged.delayS = Math.round(merged.delayMs / 1000);
+    }
+    delete merged.delayMs;
+    delete merged.cabinPreset; // removed field
+    return merged;
   }
 
   function saveSettings(settings) {
@@ -189,8 +188,6 @@
   function readFormSettings() {
     const routePreset = getField("cxah-route-preset").value;
     const route = ROUTE_PRESETS.find((item) => item.value === routePreset);
-    const cabinPreset = getField("cxah-cabin-preset").value;
-    const cabinChoice = getField("cxah-cabin").value || cabinPreset;
     return {
       routePreset,
       origin: getField("cxah-origin").value.trim() || (route && route.origin) || "",
@@ -198,10 +195,9 @@
       startDate: getField("cxah-start-date").value,
       days: Math.max(1, Math.min(MAX_DAYS, Number(getField("cxah-days").value) || DEFAULT_SETTINGS.days)),
       adults: Math.max(1, Math.min(4, Number(getField("cxah-adults").value) || DEFAULT_SETTINGS.adults)),
-      cabinPreset,
-      cabin: cabinChoice,
+      cabin: getField("cxah-cabin").value,
       directOnly: Boolean(getField("cxah-direct-only").checked),
-      delayMs: Math.max(1200, Number(getField("cxah-delay").value) || DEFAULT_DELAY_MS),
+      delayS: Math.max(1, Number(getField("cxah-delay").value) || DEFAULT_DELAY_S),
     };
   }
 
@@ -212,10 +208,9 @@
     getField("cxah-start-date").value = settings.startDate || "";
     getField("cxah-days").value = settings.days || DEFAULT_SETTINGS.days;
     getField("cxah-adults").value = settings.adults || DEFAULT_SETTINGS.adults;
-    getField("cxah-cabin-preset").value = settings.cabinPreset || "";
     getField("cxah-cabin").value = settings.cabin || "";
     getField("cxah-direct-only").checked = settings.directOnly !== false;
-    getField("cxah-delay").value = settings.delayMs || DEFAULT_DELAY_MS;
+    getField("cxah-delay").value = settings.delayS || DEFAULT_DELAY_S;
   }
 
   function buildOptions(options, selectedValue) {
@@ -240,13 +235,7 @@
     }
   }
 
-  function applyCabinPreset() {
-    const selected = CABIN_PRESETS.find((item) => item.value === getField("cxah-cabin-preset").value);
-    if (!selected) {
-      return;
-    }
-    getField("cxah-cabin").value = selected.cabin;
-  }
+  // applyCabinPreset removed - cabin is now a single dropdown
 
   function setStatus(message) {
     state.status = message;
@@ -1776,7 +1765,7 @@
       adults: settings.adults,
       cabin: settings.cabin,
       directOnly: settings.directOnly,
-      delayMs: settings.delayMs,
+      delayMs: (settings.delayS || DEFAULT_DELAY_S) * 1000,
       origin: settings.origin,
       destination: settings.destination,
       settings: settings, // preserve form values across cross-origin navigation
@@ -1923,11 +1912,24 @@
         padding: 12px 14px 8px;
         font-size: 14px;
         font-weight: 700;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
       }
-      #${PANEL_ID} .cxah-copy {
-        padding: 0 14px 10px;
-        color: #d7dfdc;
+      #${PANEL_ID} .cxah-collapse-btn {
+        width: 28px !important;
+        height: 28px;
+        padding: 0;
+        font-size: 18px;
+        line-height: 1;
+        border-radius: 6px;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid #59716c;
+        color: #f3f0e8;
+        cursor: pointer;
+        flex-shrink: 0;
       }
+      #${PANEL_ID} .cxah-collapse-btn:hover { background: rgba(255,255,255,0.15); }
       #${PANEL_ID} .cxah-steps {
         margin: 0 14px 12px;
         padding: 10px 12px;
@@ -2047,89 +2049,86 @@
 
     const panel = document.createElement("section");
     panel.id = PANEL_ID;
+    const delayVal = settings.delayS || DEFAULT_DELAY_S;
     panel.innerHTML = `
-      <div class="cxah-head">Cathay Award Helper</div>
-      <div class="cxah-copy">Scans a range of dates for nonstop award availability. Set your route, cabin, date range, then click Search.</div>
-      <div class="cxah-steps">
-        <div>1. Make sure you're on Cathay's homepage with route and trip type already set.</div>
-        <div>2. Fill in the start date, cabin, and number of days below.</div>
-        <div>3. Click "Search date range". The script handles the rest: sets dates, toggles Book with miles, enables Direct flights, and collects nonstop results.</div>
-        <div class="cxah-seed-meta">${run && run.active ? `Active run started ${new Date(run.startedAt).toLocaleString()}` : "No active run"}</div>
+      <div class="cxah-head">
+        <span>Cathay Award Helper</span>
+        <button type="button" id="cxah-collapse" class="cxah-collapse-btn" title="Collapse">&ndash;</button>
       </div>
-      <div class="cxah-grid">
-        <div class="cxah-section-title">Presets</div>
-        <div>
-          <label for="cxah-route-preset">Route preset</label>
-          <select id="cxah-route-preset">
-            ${buildOptions(ROUTE_PRESETS, settings.routePreset || "")}
-          </select>
+      <div id="cxah-body">
+        <div class="cxah-steps">
+          <div>1. Log in to your Cathay account and set your route &amp; trip type on the homepage.</div>
+          <div>2. Fill in start date, cabin, and days below.</div>
+          <div>3. Click "Search date range" - the script does the rest.</div>
+          <div class="cxah-seed-meta">${run && run.active ? `Active run started ${new Date(run.startedAt).toLocaleString()}` : ""}</div>
         </div>
-        <div>
-          <label for="cxah-cabin-preset">Cabin preset</label>
-          <select id="cxah-cabin-preset">
-            ${buildOptions(CABIN_PRESETS, settings.cabinPreset || "")}
-          </select>
+        <div class="cxah-grid">
+          <div>
+            <label for="cxah-route-preset">Route</label>
+            <select id="cxah-route-preset">
+              ${buildOptions(ROUTE_PRESETS, settings.routePreset || "")}
+            </select>
+          </div>
+          <div>
+            <label for="cxah-cabin">Cabin</label>
+            <select id="cxah-cabin">
+              <option value="Y" ${settings.cabin === "Y" ? "selected" : ""}>Economy</option>
+              <option value="PY" ${settings.cabin === "PY" ? "selected" : ""}>Premium Economy</option>
+              <option value="J" ${settings.cabin === "J" ? "selected" : ""}>Business</option>
+              <option value="F" ${settings.cabin === "F" ? "selected" : ""}>First</option>
+            </select>
+          </div>
+          <div>
+            <label for="cxah-origin">Origin</label>
+            <input id="cxah-origin" maxlength="40" placeholder="JFK" value="${settings.origin}" />
+          </div>
+          <div>
+            <label for="cxah-destination">Destination</label>
+            <input id="cxah-destination" maxlength="40" placeholder="HKG" value="${settings.destination}" />
+          </div>
+          <div>
+            <label for="cxah-start-date">Start date</label>
+            <input id="cxah-start-date" type="date" value="${settings.startDate}" />
+          </div>
+          <div>
+            <label for="cxah-days">Days (max ${MAX_DAYS})</label>
+            <input id="cxah-days" type="number" min="1" max="${MAX_DAYS}" value="${settings.days}" />
+          </div>
+          <div>
+            <label for="cxah-adults">Adults</label>
+            <input id="cxah-adults" type="number" min="1" max="4" value="${settings.adults}" />
+          </div>
+          <div>
+            <label for="cxah-delay">Delay (sec)</label>
+            <input id="cxah-delay" type="number" min="1" max="30" step="1" value="${delayVal}" />
+          </div>
+          <div class="cxah-toggle-row">
+            <input id="cxah-direct-only" type="checkbox" ${settings.directOnly !== false ? "checked" : ""} />
+            <label for="cxah-direct-only">Direct flights only</label>
+          </div>
         </div>
-        <div class="cxah-section-title">Search details</div>
-        <div>
-          <label for="cxah-origin">Origin</label>
-          <input id="cxah-origin" maxlength="40" placeholder="JFK or New York, (JFK)" value="${settings.origin}" />
+        <div class="cxah-actions">
+          <button type="button" class="cxah-run" id="cxah-run">Search date range</button>
+          <button type="button" id="cxah-stop-run" style="background:#8b3a3a;">Stop</button>
+          <button type="button" id="cxah-save-defaults">Save defaults</button>
+          <button type="button" id="cxah-reset-defaults">Reset defaults</button>
+          <button type="button" id="cxah-clear-run">Clear current run</button>
         </div>
-        <div>
-          <label for="cxah-destination">Destination</label>
-          <input id="cxah-destination" maxlength="40" placeholder="HKG or Hong Kong, (HKG)" value="${settings.destination}" />
-        </div>
-        <div>
-          <label for="cxah-start-date">Start date</label>
-          <input id="cxah-start-date" type="date" value="${settings.startDate}" />
-        </div>
-        <div>
-          <label for="cxah-days">Days (max ${MAX_DAYS})</label>
-          <input id="cxah-days" type="number" min="1" max="${MAX_DAYS}" value="${settings.days}" />
-        </div>
-        <div>
-          <label for="cxah-adults">Adults</label>
-          <input id="cxah-adults" type="number" min="1" max="4" value="${settings.adults}" />
-        </div>
-        <div>
-          <label for="cxah-cabin">Cabin to verify</label>
-          <select id="cxah-cabin">
-            <option value="Y" ${settings.cabin === "Y" ? "selected" : ""}>Economy</option>
-            <option value="PY" ${settings.cabin === "PY" ? "selected" : ""}>Premium Economy</option>
-            <option value="J" ${settings.cabin === "J" ? "selected" : ""}>Business</option>
-            <option value="F" ${settings.cabin === "F" ? "selected" : ""}>First</option>
-          </select>
-        </div>
-        <div class="cxah-toggle-row">
-          <input id="cxah-direct-only" type="checkbox" ${settings.directOnly !== false ? "checked" : ""} />
-          <label for="cxah-direct-only">Direct flights only</label>
-        </div>
-        <div style="grid-column: 1 / -1;">
-          <label for="cxah-delay">Delay between searches (ms)</label>
-          <input id="cxah-delay" type="number" min="1200" step="100" value="${settings.delayMs}" />
-        </div>
+        <div class="cxah-status">${state.status}</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Flight</th>
+              <th>Time</th>
+              <th>Dur.</th>
+              <th>Miles</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="cxah-note">Best-effort: drives Cathay's visible UI. Refresh if stuck.</div>
       </div>
-      <div class="cxah-actions">
-        <button type="button" class="cxah-run" id="cxah-run">Search date range</button>
-        <button type="button" id="cxah-stop-run" style="background:#8b3a3a;">Stop</button>
-        <button type="button" id="cxah-save-defaults">Save defaults</button>
-        <button type="button" id="cxah-reset-defaults">Reset defaults</button>
-        <button type="button" id="cxah-clear-run">Clear current run</button>
-      </div>
-      <div class="cxah-status">${state.status}</div>
-      <table>
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Flight</th>
-            <th>Time</th>
-            <th>Dur.</th>
-            <th>Miles</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div class="cxah-note">This is best-effort. It drives Cathay's visible UI, not hidden APIs. Refresh if the site gets stuck.</div>
     `;
 
     document.documentElement.appendChild(panel);
@@ -2139,8 +2138,18 @@
     panel.querySelector("#cxah-reset-defaults").addEventListener("click", onResetDefaultsClick);
     panel.querySelector("#cxah-clear-run").addEventListener("click", onClearRunClick);
     panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
-    panel.querySelector("#cxah-cabin-preset").addEventListener("change", applyCabinPreset);
+    panel.querySelector("#cxah-collapse").addEventListener("click", toggleCollapse);
     renderResults();
+  }
+
+  function toggleCollapse() {
+    const body = document.getElementById("cxah-body");
+    const btn = document.getElementById("cxah-collapse");
+    if (!body || !btn) return;
+    const collapsed = body.style.display === "none";
+    body.style.display = collapsed ? "" : "none";
+    btn.textContent = collapsed ? "\u2013" : "+";
+    btn.title = collapsed ? "Collapse" : "Expand";
   }
 
   function boot() {
