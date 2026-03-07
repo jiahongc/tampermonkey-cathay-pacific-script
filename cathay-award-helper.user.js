@@ -265,9 +265,8 @@
 
   function clickElement(el) {
     const target = el.closest("button, a, label, [role='button'], [tabindex]") || el;
-    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    // Use full pointer+mouse+click sequence for React Aria compatibility
+    forceClick(target);
   }
 
   function isHomepage() {
@@ -1785,11 +1784,19 @@
       return;
     }
 
-    // Check if the current cabin display already shows what we want
-    const cabinField = findVisibleElements("div, button, section").find((el) => {
+    // Find the "Cabin class and passengers" clickable area on the homepage.
+    // It shows text like "Cabin class and passengers\nPremium Economy, 1 Adult"
+    // Pick the SMALLEST matching element to get the actual clickable field, not a huge parent.
+    const cabinCandidates = findVisibleElements("div, button, section").filter((el) => {
       const text = normalizeText(el.innerText);
       return /Cabin class and passengers/i.test(text) && text.length < 200;
     });
+    cabinCandidates.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) - (rb.width * rb.height);
+    });
+    const cabinField = cabinCandidates[0];
 
     if (!cabinField) {
       console.log("[CX Helper] Could not find 'Cabin class and passengers' field");
@@ -1798,8 +1805,9 @@
 
     const currentText = normalizeText(cabinField.innerText);
     const currentCabinOk = new RegExp(cabinLabel, "i").test(currentText);
-    const adultStr = adults + " Adult" + (adults > 1 ? "s" : "");
-    const currentAdultsOk = new RegExp(adultStr, "i").test(currentText) || (adults === 1 && /1 Adult\b/i.test(currentText));
+    const currentAdultsOk = adults === 1
+      ? /1 Adult\b/i.test(currentText)
+      : new RegExp(adults + " Adult", "i").test(currentText);
 
     if (currentCabinOk && currentAdultsOk) {
       console.log("[CX Helper] Cabin and passengers already set correctly:", currentText);
@@ -1808,112 +1816,316 @@
 
     console.log("[CX Helper] Opening cabin/passenger popup. Current:", currentText,
       "Want:", cabinLabel, adults, "adults");
+    console.log("[CX Helper] cabinField:", cabinField.tagName, cabinField.className,
+      "rect:", JSON.stringify(cabinField.getBoundingClientRect()));
 
-    // Click to open the popup
+    // Try multiple strategies to open the popup
+    function isPopupOpen() {
+      const bodyText = document.body ? document.body.innerText : "";
+      // Check for various popup indicators
+      return /Select cabin class/i.test(bodyText) ||
+        (/\bClass\b/.test(bodyText) && /Adults\s*\(12\+\)/i.test(bodyText) && /\bDone\b/i.test(bodyText));
+    }
+
+    let popupReady = false;
+
+    // Strategy A: Click the smallest matching element directly
+    console.log("[CX Helper] Popup strategy A: click smallest cabinField");
     forceClick(cabinField);
     await sleep(1500);
+    if (isPopupOpen()) { popupReady = true; }
 
-    // Wait for the popup to appear (look for "Select cabin class" text)
-    let popupReady = false;
-    for (let w = 0; w < 8; w++) {
-      const bodyText = document.body ? document.body.innerText : "";
-      if (/Select cabin class/i.test(bodyText) || /Class\s+(First|Business|Premium|Economy)/i.test(bodyText)) {
-        popupReady = true;
-        break;
-      }
-      await sleep(500);
-    }
+    // Strategy B: Try clicking each candidate from smallest to largest
     if (!popupReady) {
-      console.log("[CX Helper] Cabin popup did not open");
+      for (let ci = 0; ci < Math.min(cabinCandidates.length, 5); ci++) {
+        const candidate = cabinCandidates[ci];
+        if (candidate === cabinField) continue;
+        console.log("[CX Helper] Popup strategy B: click candidate", ci,
+          candidate.tagName, candidate.className.slice(0, 60));
+        forceClick(candidate);
+        await sleep(1200);
+        if (isPopupOpen()) { popupReady = true; break; }
+      }
+    }
+
+    // Strategy C: Look for an element with data-slot or specific class related to cabin
+    if (!popupReady) {
+      const cabinTrigger = findVisibleElements("div, button, a").find((el) => {
+        const text = normalizeText(el.innerText);
+        return /(Premium Economy|Economy|Business|First),?\s*\d+\s*Adult/i.test(text) &&
+          text.length < 80;
+      });
+      if (cabinTrigger) {
+        console.log("[CX Helper] Popup strategy C: click cabin trigger:",
+          cabinTrigger.tagName, normalizeText(cabinTrigger.innerText).slice(0, 50));
+        forceClick(cabinTrigger);
+        await sleep(1200);
+        if (isPopupOpen()) { popupReady = true; }
+        // Also try parent
+        if (!popupReady && cabinTrigger.parentElement) {
+          forceClick(cabinTrigger.parentElement);
+          await sleep(1200);
+          if (isPopupOpen()) { popupReady = true; }
+        }
+      }
+    }
+
+    // Strategy D: Try native .click() on the cabin field and its parents
+    if (!popupReady) {
+      console.log("[CX Helper] Popup strategy D: native .click() on field and parents");
+      let el = cabinField;
+      for (let depth = 0; depth < 4 && el; depth++) {
+        try { el.click(); } catch (e) { /* ignore */ }
+        await sleep(1000);
+        if (isPopupOpen()) { popupReady = true; break; }
+        el = el.parentElement;
+      }
+    }
+
+    // Wait a bit more for any slow popup animation
+    if (!popupReady) {
+      for (let w = 0; w < 6; w++) {
+        await sleep(500);
+        if (isPopupOpen()) { popupReady = true; break; }
+      }
+    }
+
+    if (!popupReady) {
+      console.log("[CX Helper] Cabin popup did not open after all strategies");
       return;
     }
+    console.log("[CX Helper] Cabin popup is open");
 
     // --- Set cabin class ---
     if (!currentCabinOk) {
-      // Find and click the Class dropdown to open it
-      const classDropdown = findVisibleElements("div, button, select").find((el) => {
-        const text = normalizeText(el.innerText);
-        return /^Class\s+(First|Business|Premium Economy|Economy)$/i.test(text) && text.length < 40;
-      });
-      if (classDropdown) {
-        console.log("[CX Helper] Clicking Class dropdown:", normalizeText(classDropdown.innerText));
-        forceClick(classDropdown);
-        await sleep(800);
+      // The Class dropdown is a custom component. The trigger is the SPAN showing the
+      // current cabin value (e.g., "Premium Economy") — clicking it with native .click()
+      // opens the dropdown list. Then click the target option to select it.
+      console.log("[CX Helper] Setting cabin class. Want:", cabinLabel);
+
+      // Helper: check if dropdown options are visible
+      function countVisibleCabinOptions() {
+        const opts = findVisibleElements("*").filter((o) => {
+          const t = normalizeText(o.innerText);
+          return /^(First|Business|Premium Economy|Economy)$/i.test(t);
+        });
+        return new Set(opts.map((o) => normalizeText(o.innerText)));
       }
 
-      // Find and click the target cabin option in the dropdown list
-      const cabinOption = findVisibleElements("div, li, button, a, span").find((el) => {
-        const text = normalizeText(el.innerText);
-        return text === cabinLabel;
+      let dropdownOpened = false;
+
+      // Primary: click the current cabin value text (SPAN.dropdown__value or similar)
+      const valueEls = findVisibleElements("div, span, p").filter((el) => {
+        const t = normalizeText(el.innerText);
+        return /^(First|Business|Premium Economy|Economy)$/i.test(t);
       });
-      if (cabinOption) {
-        console.log("[CX Helper] Selecting cabin:", cabinLabel);
-        forceClick(cabinOption);
-        await sleep(1000);
+      valueEls.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return (ra.width * ra.height) - (rb.width * rb.height);
+      });
+      for (const el of valueEls.slice(0, 3)) {
+        console.log("[CX Helper] Clicking cabin value:", el.tagName,
+          (el.className || "").split(" ")[0], normalizeText(el.innerText));
+        el.click();
+        await sleep(800);
+        const opts = countVisibleCabinOptions();
+        if (opts.size >= 3) {
+          console.log("[CX Helper] Dropdown opened with options:", Array.from(opts));
+          dropdownOpened = true;
+          break;
+        }
+      }
+
+      // Fallback: try clicking dropdown container divs
+      if (!dropdownOpened) {
+        const dropdownEls = findVisibleElements("div").filter((el) => {
+          const text = normalizeText(el.innerText);
+          return /Class/i.test(text) && /(First|Business|Premium Economy|Economy)/i.test(text) &&
+            text.length < 80;
+        });
+        dropdownEls.sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          return (ra.width * ra.height) - (rb.width * rb.height);
+        });
+        for (const el of dropdownEls.slice(0, 3)) {
+          el.click();
+          await sleep(800);
+          if (countVisibleCabinOptions().size >= 3) { dropdownOpened = true; break; }
+          forceClick(el);
+          await sleep(800);
+          if (countVisibleCabinOptions().size >= 3) { dropdownOpened = true; break; }
+        }
+      }
+
+      if (dropdownOpened) {
+        // Click the target cabin option (smallest matching element)
+        await sleep(300);
+        const optionEls = findVisibleElements("*").filter((el) => {
+          return normalizeText(el.innerText) === cabinLabel;
+        });
+        optionEls.sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          return (ra.width * ra.height) - (rb.width * rb.height);
+        });
+        if (optionEls.length > 0) {
+          console.log("[CX Helper] Selecting cabin:", cabinLabel,
+            optionEls[0].tagName, (optionEls[0].className || "").split(" ")[0]);
+          optionEls[0].click();
+          await sleep(1000);
+          console.log("[CX Helper] Cabin set to", cabinLabel);
+        } else {
+          console.log("[CX Helper] Could not find option:", cabinLabel);
+        }
       } else {
-        console.log("[CX Helper] Could not find cabin option for:", cabinLabel);
+        console.log("[CX Helper] Could not open class dropdown");
       }
     }
 
     // --- Set adult count ---
     if (!currentAdultsOk) {
-      // Find the Adults (12+) section and its +/- buttons
-      const adultsLabel = findVisibleElements("div, span, label").find((el) => {
-        return /Adults\s*\(12\+\)/i.test(normalizeText(el.innerText));
+      await setAdultCount(adults);
+    }
+
+    // Click Done button - search broadly (may not be a <button>)
+    await sleep(500);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // Find all elements with "Done" text, sort smallest first to get actual button not container
+      const doneCandidates = findVisibleElements("button, div, a, span, *").filter((el) => {
+        return /^Done$/i.test(normalizeText(el.innerText));
       });
-
-      if (adultsLabel) {
-        // Find the current count and the +/- buttons near the label
-        const parent = adultsLabel.parentElement;
-        if (parent) {
-          // Get current adults count from nearby text
-          const parentText = normalizeText(parent.innerText);
-          const countMatch = parentText.match(/Adults\s*\(12\+\)\s*(\d+)/i);
-          let currentAdults = countMatch ? Number(countMatch[1]) : 1;
-          console.log("[CX Helper] Current adults:", currentAdults, "Want:", adults);
-
-          // Find +/- buttons within the parent
-          const buttons = Array.from(parent.querySelectorAll("button, [role='button']")).filter((btn) => {
-            const rect = btn.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && rect.width < 60;
-          });
-
-          if (buttons.length >= 2) {
-            // Typically: [minus, plus] - the minus is first (left), plus is second (right)
-            const minusBtn = buttons[0];
-            const plusBtn = buttons[buttons.length - 1];
-
-            while (currentAdults < adults) {
-              console.log("[CX Helper] Clicking + for adults:", currentAdults, "->", currentAdults + 1);
-              forceClick(plusBtn);
-              currentAdults++;
-              await sleep(400);
-            }
-            while (currentAdults > adults) {
-              console.log("[CX Helper] Clicking - for adults:", currentAdults, "->", currentAdults - 1);
-              forceClick(minusBtn);
-              currentAdults--;
-              await sleep(400);
-            }
+      doneCandidates.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return (ra.width * ra.height) - (rb.width * rb.height);
+      });
+      const doneBtn = doneCandidates[0];
+      if (doneBtn) {
+        console.log("[CX Helper] Clicking Done (attempt " + (attempt + 1) + "):",
+          doneBtn.tagName, doneBtn.className.split(" ")[0],
+          Math.round(doneBtn.getBoundingClientRect().width) + "x" +
+          Math.round(doneBtn.getBoundingClientRect().height),
+          "of", doneCandidates.length, "candidates");
+        forceClick(doneBtn);
+        await sleep(1000);
+        // Verify popup closed
+        const bodyText = document.body ? document.body.innerText : "";
+        if (!/Adults\s*\(12\+\)/i.test(bodyText)) {
+          console.log("[CX Helper] Cabin popup closed");
+          return;
+        }
+        // If smallest didn't work and there are more candidates, try next
+        if (doneCandidates.length > 1 && attempt === 0) {
+          console.log("[CX Helper] Trying next Done candidate:",
+            doneCandidates[1].tagName, doneCandidates[1].className.split(" ")[0]);
+          forceClick(doneCandidates[1]);
+          await sleep(1000);
+          const bodyText2 = document.body ? document.body.innerText : "";
+          if (!/Adults\s*\(12\+\)/i.test(bodyText2)) {
+            console.log("[CX Helper] Cabin popup closed via candidate 2");
+            return;
           }
         }
       } else {
-        console.log("[CX Helper] Could not find 'Adults (12+)' label");
+        console.log("[CX Helper] Done element not found, attempt", attempt + 1);
+        break;
+      }
+    }
+    console.log("[CX Helper] Cabin/passenger setup complete");
+  }
+
+  async function setAdultCount(targetAdults) {
+    console.log("[CX Helper] setAdultCount: target =", targetAdults);
+
+    // Best approach: Find +/- buttons directly via aria-label.
+    // The logs showed buttons with aria-label "Decrease adult" and "Increase adult".
+    const allBtns = findVisibleElements("button, [role='button']");
+    let minusBtn = allBtns.find((b) => /decrease\s*adult/i.test(b.getAttribute("aria-label") || ""));
+    let plusBtn = allBtns.find((b) => /increase\s*adult/i.test(b.getAttribute("aria-label") || ""));
+
+    // Fallback: find buttons with – and + text near "Adults" label
+    if (!minusBtn || !plusBtn) {
+      console.log("[CX Helper] aria-label buttons not found, trying text/position approach");
+      const smallBtns = allBtns.filter((b) => {
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.width < 60 && r.height < 60;
+      });
+      if (!minusBtn) {
+        minusBtn = smallBtns.find((b) => /^[−\-\u2212]$/.test(normalizeText(b.innerText).trim()));
+      }
+      if (!plusBtn) {
+        plusBtn = smallBtns.find((b) => /^\+$/.test(normalizeText(b.innerText).trim()));
       }
     }
 
-    // Click Done button
-    await sleep(500);
-    const doneBtn = findVisibleElements("button").find((el) => {
-      return /^Done$/i.test(normalizeText(el.innerText));
-    });
-    if (doneBtn) {
-      console.log("[CX Helper] Clicking Done");
-      forceClick(doneBtn);
-      await sleep(1000);
-    } else {
-      console.log("[CX Helper] Could not find Done button");
+    if (!minusBtn || !plusBtn) {
+      console.log("[CX Helper] Could not find adult +/- buttons");
+      // Dump for debugging
+      const relevantBtns = allBtns.filter((b) => {
+        const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+        const text = normalizeText(b.innerText).trim();
+        return aria.includes("adult") || aria.includes("crease") ||
+          /^[−\-\u2212+]$/.test(text);
+      });
+      console.log("[CX Helper] Relevant buttons:",
+        relevantBtns.map((b) => b.tagName + " text:'" + normalizeText(b.innerText).slice(0, 5) +
+          "' aria:'" + (b.getAttribute("aria-label") || "") + "'"));
+      return;
     }
+
+    console.log("[CX Helper] Found adult buttons:",
+      "minus:", minusBtn.getAttribute("aria-label") || normalizeText(minusBtn.innerText),
+      "plus:", plusBtn.getAttribute("aria-label") || normalizeText(plusBtn.innerText));
+
+    // Read current count: find the number element between the – and + buttons
+    // Look for a sibling or nearby element that contains just a number
+    let current = 1;
+    const minusRect = minusBtn.getBoundingClientRect();
+    const plusRect = plusBtn.getBoundingClientRect();
+    const countEls = findVisibleElements("span, div, p, input").filter((el) => {
+      const r = el.getBoundingClientRect();
+      const text = normalizeText(el.innerText || el.value || "").trim();
+      // Must be a single number, positioned between minus and plus buttons
+      return /^\d+$/.test(text) &&
+        r.left >= minusRect.left - 5 &&
+        r.right <= plusRect.right + 5 &&
+        Math.abs(r.top - minusRect.top) < 30;
+    });
+    if (countEls.length > 0) {
+      current = Number(normalizeText(countEls[0].innerText || countEls[0].value || "1").trim());
+    }
+    // Also check for input[type=number] between buttons
+    if (countEls.length === 0) {
+      const inputs = findVisibleElements("input").filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.left >= minusRect.left - 5 && r.right <= plusRect.right + 5 &&
+          Math.abs(r.top - minusRect.top) < 30;
+      });
+      if (inputs.length > 0) {
+        current = Number(inputs[0].value) || 1;
+      }
+    }
+    console.log("[CX Helper] Adults count: current =", current, "target =", targetAdults);
+
+    // Click + or - to reach target
+    let clicks = 0;
+    while (current < targetAdults && clicks < 8) {
+      console.log("[CX Helper] Clicking + for adults:", current, "->", current + 1);
+      forceClick(plusBtn);
+      current++;
+      clicks++;
+      await sleep(500);
+    }
+    while (current > targetAdults && current > 1 && clicks < 8) {
+      console.log("[CX Helper] Clicking - for adults:", current, "->", current - 1);
+      forceClick(minusBtn);
+      current--;
+      clicks++;
+      await sleep(500);
+    }
+    console.log("[CX Helper] Adults count set to", current);
   }
 
   async function launchHomepageSearchForRun(run) {
@@ -2067,7 +2279,10 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
+        cursor: grab;
+        user-select: none;
       }
+      #${PANEL_ID} .cxah-head:active { cursor: grabbing; }
       #${PANEL_ID} .cxah-collapse-btn {
         width: 28px !important;
         height: 28px;
@@ -2127,6 +2342,8 @@
         padding: 8px 10px;
         background: #152325;
         color: #f3f0e8;
+      }
+      #${PANEL_ID} select {
         -webkit-appearance: none;
         appearance: none;
       }
@@ -2301,7 +2518,37 @@
     panel.querySelector("#cxah-clear-run").addEventListener("click", onClearRunClick);
     panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
     panel.querySelector("#cxah-collapse").addEventListener("click", toggleCollapse);
+    makeDraggable(panel, panel.querySelector(".cxah-head"));
     renderResults();
+  }
+
+  function makeDraggable(panel, handle) {
+    let startX, startY, startLeft, startTop, dragging = false;
+
+    handle.addEventListener("mousedown", (e) => {
+      // Don't drag when clicking the collapse button
+      if (e.target.closest(".cxah-collapse-btn")) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      panel.style.left = (startLeft + dx) + "px";
+      panel.style.top = (startTop + dy) + "px";
+      panel.style.right = "auto";
+    });
+
+    document.addEventListener("mouseup", () => {
+      dragging = false;
+    });
   }
 
   function toggleCollapse() {
