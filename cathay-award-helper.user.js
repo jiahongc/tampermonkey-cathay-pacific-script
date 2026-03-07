@@ -1774,6 +1774,148 @@
     };
   }
 
+  /**
+   * Set the cabin class and passenger count on the Cathay homepage.
+   * Opens the "Cabin class and passengers" popup, selects the class, adjusts adults, clicks Done.
+   */
+  async function setHomepageCabinAndPassengers(cabinCode, adults) {
+    const cabinLabel = CABIN_LABELS[cabinCode];
+    if (!cabinLabel) {
+      console.log("[CX Helper] Unknown cabin code:", cabinCode);
+      return;
+    }
+
+    // Check if the current cabin display already shows what we want
+    const cabinField = findVisibleElements("div, button, section").find((el) => {
+      const text = normalizeText(el.innerText);
+      return /Cabin class and passengers/i.test(text) && text.length < 200;
+    });
+
+    if (!cabinField) {
+      console.log("[CX Helper] Could not find 'Cabin class and passengers' field");
+      return;
+    }
+
+    const currentText = normalizeText(cabinField.innerText);
+    const currentCabinOk = new RegExp(cabinLabel, "i").test(currentText);
+    const adultStr = adults + " Adult" + (adults > 1 ? "s" : "");
+    const currentAdultsOk = new RegExp(adultStr, "i").test(currentText) || (adults === 1 && /1 Adult\b/i.test(currentText));
+
+    if (currentCabinOk && currentAdultsOk) {
+      console.log("[CX Helper] Cabin and passengers already set correctly:", currentText);
+      return;
+    }
+
+    console.log("[CX Helper] Opening cabin/passenger popup. Current:", currentText,
+      "Want:", cabinLabel, adults, "adults");
+
+    // Click to open the popup
+    forceClick(cabinField);
+    await sleep(1500);
+
+    // Wait for the popup to appear (look for "Select cabin class" text)
+    let popupReady = false;
+    for (let w = 0; w < 8; w++) {
+      const bodyText = document.body ? document.body.innerText : "";
+      if (/Select cabin class/i.test(bodyText) || /Class\s+(First|Business|Premium|Economy)/i.test(bodyText)) {
+        popupReady = true;
+        break;
+      }
+      await sleep(500);
+    }
+    if (!popupReady) {
+      console.log("[CX Helper] Cabin popup did not open");
+      return;
+    }
+
+    // --- Set cabin class ---
+    if (!currentCabinOk) {
+      // Find and click the Class dropdown to open it
+      const classDropdown = findVisibleElements("div, button, select").find((el) => {
+        const text = normalizeText(el.innerText);
+        return /^Class\s+(First|Business|Premium Economy|Economy)$/i.test(text) && text.length < 40;
+      });
+      if (classDropdown) {
+        console.log("[CX Helper] Clicking Class dropdown:", normalizeText(classDropdown.innerText));
+        forceClick(classDropdown);
+        await sleep(800);
+      }
+
+      // Find and click the target cabin option in the dropdown list
+      const cabinOption = findVisibleElements("div, li, button, a, span").find((el) => {
+        const text = normalizeText(el.innerText);
+        return text === cabinLabel;
+      });
+      if (cabinOption) {
+        console.log("[CX Helper] Selecting cabin:", cabinLabel);
+        forceClick(cabinOption);
+        await sleep(1000);
+      } else {
+        console.log("[CX Helper] Could not find cabin option for:", cabinLabel);
+      }
+    }
+
+    // --- Set adult count ---
+    if (!currentAdultsOk) {
+      // Find the Adults (12+) section and its +/- buttons
+      const adultsLabel = findVisibleElements("div, span, label").find((el) => {
+        return /Adults\s*\(12\+\)/i.test(normalizeText(el.innerText));
+      });
+
+      if (adultsLabel) {
+        // Find the current count and the +/- buttons near the label
+        const parent = adultsLabel.parentElement;
+        if (parent) {
+          // Get current adults count from nearby text
+          const parentText = normalizeText(parent.innerText);
+          const countMatch = parentText.match(/Adults\s*\(12\+\)\s*(\d+)/i);
+          let currentAdults = countMatch ? Number(countMatch[1]) : 1;
+          console.log("[CX Helper] Current adults:", currentAdults, "Want:", adults);
+
+          // Find +/- buttons within the parent
+          const buttons = Array.from(parent.querySelectorAll("button, [role='button']")).filter((btn) => {
+            const rect = btn.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.width < 60;
+          });
+
+          if (buttons.length >= 2) {
+            // Typically: [minus, plus] - the minus is first (left), plus is second (right)
+            const minusBtn = buttons[0];
+            const plusBtn = buttons[buttons.length - 1];
+
+            while (currentAdults < adults) {
+              console.log("[CX Helper] Clicking + for adults:", currentAdults, "->", currentAdults + 1);
+              forceClick(plusBtn);
+              currentAdults++;
+              await sleep(400);
+            }
+            while (currentAdults > adults) {
+              console.log("[CX Helper] Clicking - for adults:", currentAdults, "->", currentAdults - 1);
+              forceClick(minusBtn);
+              currentAdults--;
+              await sleep(400);
+            }
+          }
+        }
+      } else {
+        console.log("[CX Helper] Could not find 'Adults (12+)' label");
+      }
+    }
+
+    // Click Done button
+    await sleep(500);
+    const doneBtn = findVisibleElements("button").find((el) => {
+      return /^Done$/i.test(normalizeText(el.innerText));
+    });
+    if (doneBtn) {
+      console.log("[CX Helper] Clicking Done");
+      forceClick(doneBtn);
+      await sleep(1000);
+    } else {
+      console.log("[CX Helper] Could not find Done button");
+    }
+  }
+
   async function launchHomepageSearchForRun(run) {
     console.log("[CX Helper] launchHomepageSearchForRun: starting, isHomepage=", isHomepage());
     if (!isHomepage()) {
@@ -1787,6 +1929,16 @@
       setStatus('Stopped: Could not turn on "Book with miles" automatically.');
       return;
     }
+    // Set cabin class and passenger count
+    if (run.cabin || run.adults > 1) {
+      setStatus("Setting cabin and passengers...");
+      try {
+        await setHomepageCabinAndPassengers(run.cabin, run.adults || 1);
+      } catch (e) {
+        console.log("[CX Helper] setHomepageCabinAndPassengers error (non-fatal):", e.message);
+      }
+    }
+
     const targetDate = addDays(run.startDate, run.offset || 0);
     setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)}...`);
     console.log("[CX Helper] About to set homepage date to:", targetDate);
@@ -1973,6 +2125,16 @@
         border-radius: 8px;
         border: 1px solid #59716c;
         padding: 8px 10px;
+        background: #152325;
+        color: #f3f0e8;
+        -webkit-appearance: none;
+        appearance: none;
+      }
+      #${PANEL_ID} select {
+        background: #152325 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239fb6b0' stroke-width='1.5' fill='none'/%3E%3C/svg%3E") no-repeat right 10px center;
+        padding-right: 28px;
+      }
+      #${PANEL_ID} select option {
         background: #152325;
         color: #f3f0e8;
       }
