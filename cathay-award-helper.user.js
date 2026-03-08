@@ -5,9 +5,7 @@
 // @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
 // @author       jiahongc
 // @license      MIT
-// @match        https://www.cathaypacific.com/cx/en_US.html
 // @match        https://*.cathaypacific.com/*
-// @match        https://book.cathaypacific.com/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -19,7 +17,6 @@
   const PANEL_ID = "cx-award-helper-panel";
   const STYLE_ID = "cx-award-helper-style";
   const SETTINGS_KEY = "cx-award-helper-settings-v2";
-  const RUN_KEY = "cx-award-helper-run-v2";
   const WINDOW_NAME_PREFIX = "__cx_award_helper__:";
   const LOG_PREFIX = "[CX Helper]";
   const MAX_LOG_LINES = 250;
@@ -201,7 +198,7 @@
     }
     merged.cabin = merged.cabins[0];
     delete merged.delayMs;
-    delete merged.cabinPreset; // removed field
+    delete merged.cabinPreset;
     return merged;
   }
 
@@ -398,10 +395,6 @@
       J: "cxah-cabin-j",
       F: "cxah-cabin-f",
     };
-  }
-
-  function formatCabinList(cabins) {
-    return normalizeCabinCodes(cabins).map((code) => getCabinLabel(code)).join(", ");
   }
 
   function getRunLastDate(run) {
@@ -603,10 +596,6 @@
       const text = normalizeText(el.innerText);
       return /^(Redeem flights|Search flights)$/.test(text);
     });
-  }
-
-  function findNewSearchLink() {
-    return findClickableByText(/^New search$/i);
   }
 
   function navigateToHomepage(run, reason) {
@@ -913,10 +902,6 @@
     return tiles;
   }
 
-  function findCabinTile(cabinCode) {
-    return (findVisibleCabinTiles().get(cabinCode) || {}).el || null;
-  }
-
   async function selectCabinOnResults(cabinCode, currentCabinCode) {
     if (!cabinCode) {
       return true;
@@ -1165,35 +1150,6 @@
       const placeholder = String(el.getAttribute("placeholder") || "");
       return /Start Date/i.test(aria) || /departure date/i.test(placeholder);
     });
-  }
-
-  async function trySetHomepageDateViaInput(targetDate) {
-    const input = findHomepageStartDateInput();
-    if (!input) {
-      return false;
-    }
-    const value = formatCathayInputDate(targetDate);
-    input.focus();
-    input.value = value;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    input.dispatchEvent(new Event("blur", { bubbles: true }));
-    await sleep(500);
-    return getHomepageDepartingDate() === targetDate || normalizeText(input.value) === value;
-  }
-
-  function findLeavePageButton() {
-    return findClickableByText(/^Leave page$/i);
-  }
-
-  async function confirmLeavePageIfPresent() {
-    const leaveButton = findLeavePageButton();
-    if (!leaveButton) {
-      return false;
-    }
-    clickElement(leaveButton);
-    await sleep(900);
-    return true;
   }
 
   function hasNoAvailabilityModalText(text) {
@@ -1940,10 +1896,6 @@
 
   function hasRunResult(run, dateText, cabinCode) {
     return (run.results || []).some((item) => item.date === dateText && item.cabinCode === cabinCode);
-  }
-
-  function getRunResult(run, dateText, cabinCode) {
-    return (run.results || []).find((item) => item.date === dateText && item.cabinCode === cabinCode) || null;
   }
 
   function upsertRunResult(run, result) {
@@ -2710,8 +2662,8 @@
             doneCandidates[1].tagName, doneCandidates[1].className.split(" ")[0]);
           forceClick(doneCandidates[1]);
           await sleep(1000);
-          const bodyText2 = document.body ? document.body.innerText : "";
-          if (!/Adults\s*\(12\+\)/i.test(bodyText2)) {
+          const bodyAfterRetry = document.body ? document.body.innerText : "";
+          if (!/Adults\s*\(12\+\)/i.test(bodyAfterRetry)) {
             console.log("[CX Helper] Cabin popup closed via candidate 2");
             return;
           }
@@ -3470,7 +3422,7 @@
           }
           if (isResultsPage()) {
             console.log("[CX Helper] Results page detected on attempt", wait);
-            continueRunFromResultsPage();
+            await continueRunFromResultsPage();
             return;
           }
           console.log("[CX Helper] Waiting for results page to load... attempt", wait);
@@ -3487,7 +3439,7 @@
 
       // Also handle case where we're on results page with an active run
       if (isResultsPage()) {
-        continueRunFromResultsPage();
+        await continueRunFromResultsPage();
       }
     };
 
