@@ -27,8 +27,8 @@ A Tampermonkey userscript that automates Cathay Pacific award flight searches ac
 
 | File | Description |
 |---|---|
-| `cathay-award-helper.user.js` | Production version — clean panel without debug log |
-| `cathay-award-helper-debug.user.js` | Debug version — includes in-panel debug log with Copy/Clear controls |
+| `cathay-award-helper.js` | Production version — clean panel without debug log |
+| `cathay-award-helper-debug.js` | Debug version — includes in-panel debug log with Copy/Clear controls |
 
 Both versions are functionally identical. The debug version adds a live log panel that captures `[CX Helper]` console output for easier troubleshooting.
 
@@ -42,7 +42,7 @@ Install directly from [Greasy Fork](https://greasyfork.org/en/scripts/568672-cat
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) browser extension
 2. Create a new userscript in Tampermonkey
-3. Copy the contents of `cathay-award-helper.user.js` (or the debug version) into the editor
+3. Copy the contents of `cathay-award-helper.js` (or the debug version) into the editor
 4. Save the script
 
 ## Usage

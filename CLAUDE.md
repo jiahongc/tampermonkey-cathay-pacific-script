@@ -3,8 +3,8 @@
 ## Project Context
 
 - **Type**: Tampermonkey userscript
-- **Production**: `cathay-award-helper.user.js` (no debug log panel)
-- **Debug**: `cathay-award-helper-debug.user.js` (with in-panel debug log)
+- **Production**: `cathay-award-helper.js` (no debug log panel)
+- **Debug**: `cathay-award-helper-debug.js` (with in-panel debug log)
 - **Language**: JavaScript (single-file userscript)
 - **Target site**: `cathaypacific.com` (React-based, custom components, cross-subdomain navigation)
 - **Key reference**: Read `cathay-website-patterns.md` before modifying any DOM interaction code — it documents every working pattern and the failures that led to them
