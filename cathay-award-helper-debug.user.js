@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Cathay Award Helper
+// @name         Cathay Award Helper (Debug)
 // @namespace    codex.local
 // @version      0.3.0
 // @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
@@ -18,6 +18,8 @@
   const STYLE_ID = "cx-award-helper-style";
   const SETTINGS_KEY = "cx-award-helper-settings-v2";
   const WINDOW_NAME_PREFIX = "__cx_award_helper__:";
+  const LOG_PREFIX = "[CX Helper]";
+  const MAX_LOG_LINES = 250;
   const MAX_DAYS = 14;
   const DEFAULT_DELAY_S = 2;
   const HOMEPAGE_URL = "https://www.cathaypacific.com/cx/en_US.html";
@@ -52,7 +54,55 @@
     stopping: false,
     status: 'Start from Cathay\'s homepage with "Book with miles" turned on.',
     results: [],
+    logs: [],
   };
+
+  function formatLogArg(arg) {
+    if (typeof arg === "string") {
+      return arg;
+    }
+    if (arg instanceof Error) {
+      return arg.stack || arg.message;
+    }
+    try {
+      return JSON.stringify(arg);
+    } catch (_) {
+      return String(arg);
+    }
+  }
+
+  function renderDebugLog() {
+    const el = document.getElementById("cxah-debug-log");
+    if (!el) {
+      return;
+    }
+    el.value = state.logs.join("\n");
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function pushDebugLog(args) {
+    const line = args.map(formatLogArg).join(" ");
+    state.logs.push(line);
+    if (state.logs.length > MAX_LOG_LINES) {
+      state.logs = state.logs.slice(-MAX_LOG_LINES);
+    }
+    savePersistedLogs(state.logs);
+    renderDebugLog();
+  }
+
+  function ensureLogBridge() {
+    if (console.__cxHelperLogPatched) {
+      return;
+    }
+    const originalLog = console.log.bind(console);
+    console.log = function (...args) {
+      originalLog(...args);
+      if (String(args[0] || "").startsWith(LOG_PREFIX)) {
+        pushDebugLog(args);
+      }
+    };
+    console.__cxHelperLogPatched = true;
+  }
 
   function shouldStop() {
     if (state.stopping) return true;
@@ -194,9 +244,19 @@
   function saveWindowPayload(payload) {
     const next = {
       run: payload && payload.run ? payload.run : null,
-      logs: payload && Array.isArray(payload.logs) ? payload.logs : [],
+      logs: payload && Array.isArray(payload.logs) ? payload.logs.slice(-MAX_LOG_LINES) : [],
     };
     window.name = WINDOW_NAME_PREFIX + JSON.stringify(next);
+  }
+
+  function loadPersistedLogs() {
+    return loadWindowPayload().logs || [];
+  }
+
+  function savePersistedLogs(logs) {
+    const payload = loadWindowPayload();
+    payload.logs = Array.isArray(logs) ? logs.slice(-MAX_LOG_LINES) : [];
+    saveWindowPayload(payload);
   }
 
   function loadRun() {
@@ -206,6 +266,7 @@
   function saveRun(run) {
     const payload = loadWindowPayload();
     payload.run = run || null;
+    payload.logs = state.logs.slice(-MAX_LOG_LINES);
     saveWindowPayload(payload);
   }
 
@@ -2849,6 +2910,32 @@
     setStatus('Cleared. Set your route on Cathay\'s homepage, then click Search date range.');
   }
 
+  async function onCopyLogsClick() {
+    const text = state.logs.join("\n");
+    if (!text) {
+      setStatus("No debug logs yet.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("Copied debug logs.");
+    } catch (error) {
+      setStatus("Copy failed. Select logs manually.");
+      const el = document.getElementById("cxah-debug-log");
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    }
+  }
+
+  function onClearLogsClick() {
+    state.logs = [];
+    savePersistedLogs([]);
+    renderDebugLog();
+    setStatus("Cleared debug logs.");
+  }
+
   function ensureStyles() {
     if (document.getElementById(STYLE_ID)) {
       return;
@@ -3058,6 +3145,52 @@
         color: #9fb6b0;
         font-size: 11px;
       }
+      #${PANEL_ID} .cxah-debug {
+        margin: 0 14px 14px;
+        border: 1px solid #2f4946;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+        overflow: hidden;
+      }
+      #${PANEL_ID} .cxah-debug-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        border-bottom: 1px solid #2f4946;
+      }
+      #${PANEL_ID} .cxah-debug-head strong {
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #d8e8e4;
+      }
+      #${PANEL_ID} .cxah-debug-actions {
+        display: flex;
+        gap: 6px;
+      }
+      #${PANEL_ID} .cxah-debug-actions button {
+        width: auto;
+        padding: 5px 8px;
+        font-size: 11px;
+        border-radius: 6px;
+      }
+      #${PANEL_ID} #cxah-debug-log {
+        width: 100%;
+        min-height: 140px;
+        max-height: 220px;
+        resize: vertical;
+        overflow-x: auto;
+        overflow-y: auto;
+        border: 0;
+        border-radius: 0;
+        padding: 10px;
+        background: #0f1a1b;
+        color: #d8e8e4;
+        font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        white-space: pre;
+      }
     `;
     document.documentElement.appendChild(style);
   }
@@ -3174,7 +3307,17 @@
             <tbody></tbody>
           </table>
         </div>
-        <div class="cxah-note">Best-effort: drives Cathay's visible UI. Install the Debug version for in-panel logs.</div>
+        <div class="cxah-debug">
+          <div class="cxah-debug-head">
+            <strong>Debug Log</strong>
+            <div class="cxah-debug-actions">
+              <button type="button" id="cxah-copy-logs">Copy logs</button>
+              <button type="button" id="cxah-clear-logs" style="background:#4c5f5b;">Clear logs</button>
+            </div>
+          </div>
+          <textarea id="cxah-debug-log" readonly wrap="off" placeholder="Live [CX Helper] logs will appear here."></textarea>
+        </div>
+        <div class="cxah-note">Best-effort: drives Cathay's visible UI and logs detailed strategies in the console for live debugging.</div>
       </div>
     `;
 
@@ -3184,11 +3327,14 @@
     panel.querySelector("#cxah-save-defaults").addEventListener("click", onSaveDefaultsClick);
     panel.querySelector("#cxah-reset-defaults").addEventListener("click", onResetDefaultsClick);
     panel.querySelector("#cxah-clear-run").addEventListener("click", onClearRunClick);
+    panel.querySelector("#cxah-copy-logs").addEventListener("click", onCopyLogsClick);
+    panel.querySelector("#cxah-clear-logs").addEventListener("click", onClearLogsClick);
     panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
     panel.querySelector("#cxah-swap-route").addEventListener("click", onSwapRoute);
     panel.querySelector("#cxah-collapse").addEventListener("click", toggleCollapse);
     makeDraggable(panel, panel.querySelector(".cxah-head"));
     renderResults();
+    renderDebugLog();
   }
 
   function makeDraggable(panel, handle) {
@@ -3231,6 +3377,8 @@
   }
 
   function boot() {
+    state.logs = loadPersistedLogs();
+    ensureLogBridge();
     const mount = async () => {
       ensurePanel();
       renderResults();
