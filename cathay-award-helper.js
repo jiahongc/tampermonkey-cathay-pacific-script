@@ -2756,6 +2756,129 @@
     console.log("[CX Helper] Adults count set to", current);
   }
 
+  /**
+   * Find a booking-panel input by placeholder text (the most reliable strategy
+   * on the Cathay homepage). Returns the input element or null.
+   */
+  function findBookingPanelInput(placeholderRegex) {
+    const inputs = findVisibleElements("input").filter((el) => {
+      return placeholderRegex.test(el.placeholder || "") &&
+        /bookTripPanel|bookingPanel/i.test(el.className || "");
+    });
+    if (inputs.length) return inputs[0];
+    // Fallback: any visible input matching the placeholder
+    return findVisibleElements("input").find((el) => placeholderRegex.test(el.placeholder || "")) || null;
+  }
+
+  /**
+   * Type an airport code into a Cathay homepage city picker input and select
+   * the matching suggestion from the dropdown.
+   */
+  async function fillAirportField(airportCode, inputEl) {
+    if (!airportCode || !inputEl || shouldStop()) return false;
+
+    console.log("[CX Helper] fillAirportField: setting", airportCode,
+      "into", inputEl.tagName + "." + (inputEl.className || "").slice(0, 40),
+      "placeholder:", inputEl.placeholder || "(none)",
+      "current value:", (inputEl.value || "").slice(0, 30));
+
+    // Click the input to activate it / open the picker
+    forceClick(inputEl);
+    await sleep(800);
+    if (shouldStop()) return false;
+
+    // Clear the field using the native setter (React needs this)
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    if (nativeSetter && nativeSetter.set) {
+      nativeSetter.set.call(inputEl, "");
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      inputEl.value = "";
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    inputEl.focus();
+    await sleep(300);
+
+    // Type the airport code character by character using the native setter
+    // so React picks up each keystroke
+    for (let i = 0; i < airportCode.length; i++) {
+      const partial = airportCode.slice(0, i + 1);
+      if (nativeSetter && nativeSetter.set) {
+        nativeSetter.set.call(inputEl, partial);
+      } else {
+        inputEl.value = partial;
+      }
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+      inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: airportCode[i], bubbles: true }));
+      inputEl.dispatchEvent(new KeyboardEvent("keyup", { key: airportCode[i], bubbles: true }));
+      await sleep(200);
+    }
+    console.log("[CX Helper] fillAirportField: typed", airportCode, "value now:", inputEl.value);
+    await sleep(1500); // wait for suggestion list to populate
+
+    if (shouldStop()) return false;
+
+    // Find and click the matching suggestion (look for LI with class odListField
+    // first, then any element containing the airport code)
+    const suggestions = findVisibleElements("li.odListField, li, [role='option']").filter((el) => {
+      const text = normalizeText(el.innerText);
+      return new RegExp(`\\b${escapeRegExp(airportCode)}\\b`, "i").test(text) && text.length < 200;
+    });
+
+    console.log("[CX Helper] fillAirportField: suggestions matching", airportCode + ":", suggestions.length,
+      suggestions.slice(0, 5).map((el) => `${el.tagName}.${(el.className || "").slice(0, 25)} "${normalizeText(el.innerText).slice(0, 60)}"`));
+
+    if (suggestions.length > 0) {
+      const pick = suggestions[0]; // First match is usually the best for LI elements
+      console.log("[CX Helper] fillAirportField: clicking suggestion:", pick.tagName, normalizeText(pick.innerText).slice(0, 60));
+      forceClick(pick);
+      await sleep(1000);
+      return true;
+    }
+
+    // No suggestions found — try pressing Enter as a fallback
+    console.log("[CX Helper] fillAirportField: No suggestion found for", airportCode, "- trying Enter key");
+    inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+    await sleep(1000);
+    return false;
+  }
+
+  /**
+   * Set origin and destination airports on the Cathay homepage.
+   */
+  async function setHomepageAirports(origin, destination) {
+    if (!origin && !destination) return true;
+    console.log("[CX Helper] setHomepageAirports:", origin, "→", destination);
+
+    // Find the two booking panel inputs by their known placeholders
+    const originInput = findBookingPanelInput(/departure city/i);
+    const destInput = findBookingPanelInput(/destination/i);
+    console.log("[CX Helper] setHomepageAirports: originInput=", originInput ? "found" : "NOT FOUND",
+      "destInput=", destInput ? "found" : "NOT FOUND");
+
+    if (origin && originInput) {
+      const ok = await fillAirportField(origin, originInput);
+      if (!ok) {
+        console.log("[CX Helper] Failed to set origin airport:", origin);
+      }
+      if (shouldStop()) return false;
+      await sleep(500);
+    } else if (origin) {
+      console.log("[CX Helper] Could not find origin input for", origin);
+    }
+
+    if (destination && destInput) {
+      const ok = await fillAirportField(destination, destInput);
+      if (!ok) {
+        console.log("[CX Helper] Failed to set destination airport:", destination);
+      }
+    } else if (destination) {
+      console.log("[CX Helper] Could not find destination input for", destination);
+    }
+
+    return true;
+  }
+
   async function launchHomepageSearchForRun(run) {
     if (state.running) {
       console.log("[CX Helper] launchHomepageSearchForRun skipped because another automation step is already running");
@@ -2769,7 +2892,8 @@
         return;
       }
       if (!isHomepage()) {
-        setStatus("Stopped: Start from Cathay's homepage booking form.");
+        console.log("[CX Helper] Not on homepage, navigating there...");
+        navigateToHomepage(run, "Navigating to Cathay's homepage booking form...");
         return;
       }
       const pending = findNextPendingSeed(run);
@@ -2788,6 +2912,12 @@
       if (!milesReady) {
         setStatus('Stopped: Could not turn on "Book with miles" automatically.');
         return;
+      }
+      // Set origin and destination airports
+      if (run.origin || run.destination) {
+        setStatus(`Setting airports: ${run.origin || "?"} → ${run.destination || "?"}...`);
+        await setHomepageAirports(run.origin, run.destination);
+        if (shouldStop()) return;
       }
       if (seedCabin || run.adults > 1) {
         setStatus(`Setting cabin and passengers (${getCabinLabel(seedCabin)})...`);
@@ -2839,14 +2969,10 @@
     }
 
     if (!isHomepage()) {
-      if (isResultsPage()) {
-        run.phase = "go-homepage";
-        saveRun(run);
-        setStatus("Returning to Cathay's homepage booking form...");
-        navigateToHomepage(run, "Returning to Cathay's homepage booking form...");
-        return;
-      }
-      setStatus("Stopped: Start from Cathay's homepage booking form.");
+      run.phase = "go-homepage";
+      saveRun(run);
+      setStatus("Returning to Cathay's homepage booking form...");
+      navigateToHomepage(run, "Returning to Cathay's homepage booking form...");
       return;
     }
     await launchHomepageSearchForRun(run);
