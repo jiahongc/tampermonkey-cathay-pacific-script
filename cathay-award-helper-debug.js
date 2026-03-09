@@ -963,6 +963,15 @@
       (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
   }
 
+  /**
+   * Return the day number of the currently selected strip cell, or -1 if none.
+   */
+  function getSelectedStripDay() {
+    const cells = getOrderedStripCells();
+    const sel = cells.find((entry) => entry.selected);
+    return sel ? sel.day : -1;
+  }
+
   function getOrderedStripCells() {
     const bestByDay = new Map();
     for (const cell of getVisibleCalendarCells()) {
@@ -2059,6 +2068,33 @@
 
     // Wait for flight content to load/update after clicking the day
     await waitForFlightCards(12000);
+
+    // --- Date verification: confirm the strip actually selected the target day ---
+    const verifiedDay = getSelectedStripDay();
+    console.log("[CX Helper] Post-click verification: selectedDay=", verifiedDay, "targetDay=", targetDay);
+    if (verifiedDay !== -1 && verifiedDay !== targetDay) {
+      console.log("[CX Helper] DATE MISMATCH after click! Strip shows day", verifiedDay, "but target is", targetDay, "- retrying click...");
+      // Retry: re-find the cell and click again
+      const retry = findStripCellForDay(targetDay);
+      if (retry) {
+        forceClick(retry.cell);
+        await sleep(2500);
+        const retryInner = retry.cell.querySelector("button, a, [role='button']");
+        if (retryInner) forceClick(retryInner);
+        await sleep(1500);
+        await waitForFlightCards(12000);
+        const verifiedDay2 = getSelectedStripDay();
+        console.log("[CX Helper] Retry verification: selectedDay=", verifiedDay2, "targetDay=", targetDay);
+        if (verifiedDay2 !== -1 && verifiedDay2 !== targetDay) {
+          console.log("[CX Helper] DATE STILL MISMATCHED after retry. selectedDay=", verifiedDay2, "targetDay=", targetDay);
+          return "failed";
+        }
+      } else {
+        console.log("[CX Helper] Could not re-find strip cell for day", targetDay, "on retry");
+        return "failed";
+      }
+    }
+
     return "ok";
   }
 
@@ -2153,6 +2189,24 @@
     const seedCabin = getSeedCabin(run);
     let currentCabin = seedCabin;
     const attemptedCabins = new Set();
+
+    // --- Pre-extraction date verification ---
+    const targetDay = Number(dateText.slice(8, 10));
+    const displayedDay = getSelectedStripDay();
+    if (displayedDay !== -1 && displayedDay !== targetDay) {
+      console.log("[CX Helper] collectResults: DATE MISMATCH! Page shows day", displayedDay,
+        "but we intend to extract for", dateText, "(day", targetDay, "). Re-selecting...");
+      const fixStatus = await ensureResultsDateSelected(dateText);
+      if (fixStatus === "failed") {
+        console.log("[CX Helper] collectResults: Could not fix date mismatch for", dateText, "- skipping");
+        return;
+      }
+      if (fixStatus === "unavailable") {
+        upsertRunResult(run, buildUnavailableResult(dateText, seedCabin));
+        saveRunAndRender(run);
+        return;
+      }
+    }
 
     if (!hasRunResult(run, dateText, seedCabin)) {
       let result;
