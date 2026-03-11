@@ -21,7 +21,7 @@
   const LOG_PREFIX = "[CX Helper]";
   const MAX_LOG_LINES = 250;
   const MAX_DAYS = 14;
-  const DEFAULT_DELAY_S = 2;
+  const DEFAULT_DELAY_S = 4;
   const HOMEPAGE_URL = "https://www.cathaypacific.com/cx/en_US.html";
   const CABIN_CODES = ["Y", "PY", "J", "F"];
   const DEFAULT_SETTINGS = {
@@ -138,6 +138,25 @@
     return Math.max(minimumMs || 0, Math.round(base * (multiplier || 1)));
   }
 
+  function formatElapsedMs(ms) {
+    const totalSeconds = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours) return `${hours}h ${minutes}m ${seconds}s`;
+    if (minutes) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  }
+
+  function getRunElapsedText(run) {
+    if (!run || !run.startedAt) return "";
+    const startedAtMs = Date.parse(run.startedAt);
+    if (!Number.isFinite(startedAtMs)) return "";
+    const endedAtMs = run.completedAt ? Date.parse(run.completedAt) : Date.now();
+    if (!Number.isFinite(endedAtMs)) return "";
+    return formatElapsedMs(Math.max(0, endedAtMs - startedAtMs));
+  }
+
   function armRunCooldown(run, waitMs, reason) {
     if (!run || !waitMs) {
       return;
@@ -194,6 +213,8 @@
       merged.cabins = DEFAULT_SETTINGS.cabins.slice();
     }
     merged.cabin = merged.cabins[0];
+    merged.directOnly = true;
+    merged.delayS = DEFAULT_DELAY_S;
     delete merged.delayMs;
     delete merged.cabinPreset;
     return merged;
@@ -209,6 +230,8 @@
       if (Array.isArray(run.cabinCodes) && run.cabinCodes.length) {
         merged.cabins = run.cabinCodes.slice();
       }
+      merged.directOnly = true;
+      merged.delayS = DEFAULT_DELAY_S;
       return merged;
     }
     return loadSettings();
@@ -268,6 +291,16 @@
     payload.run = run || null;
     payload.logs = state.logs.slice(-MAX_LOG_LINES);
     saveWindowPayload(payload);
+  }
+
+  function finalizeRun(run, phase) {
+    if (!run) {
+      return;
+    }
+    run.active = false;
+    run.phase = phase || run.phase || "done";
+    run.completedAt = new Date().toISOString();
+    saveRunAndRender(run);
   }
 
   function clearRun() {
@@ -418,8 +451,8 @@
       days: Math.max(1, Math.min(MAX_DAYS, Number(getField("cxah-days").value) || DEFAULT_SETTINGS.days)),
       adults: Math.max(1, Math.min(4, Number(getField("cxah-adults").value) || DEFAULT_SETTINGS.adults)),
       cabins: normalizeCabinCodes(cabins),
-      directOnly: Boolean(getField("cxah-direct-only").checked),
-      delayS: Math.max(1, Number(getField("cxah-delay").value) || DEFAULT_DELAY_S),
+      directOnly: true,
+      delayS: DEFAULT_DELAY_S,
     };
   }
 
@@ -438,8 +471,6 @@
         el.checked = cabins.includes(code);
       }
     });
-    getField("cxah-direct-only").checked = settings.directOnly !== false;
-    getField("cxah-delay").value = settings.delayS || DEFAULT_DELAY_S;
   }
 
   function buildOptions(options, selectedValue) {
@@ -571,9 +602,7 @@
       }
       const nextPending = findNextPendingSeed(run);
       if (!nextPending) {
-        run.active = false;
-        run.phase = "done";
-        saveRunAndRender(run);
+        finalizeRun(run, "done");
         setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
         window.location.assign(HOMEPAGE_URL);
         return true;
@@ -925,7 +954,7 @@
     if (shouldStop()) {
       return false;
     }
-    await waitForFlightCards(12000);
+    await waitForFlightCards(10000, 1000);
     if (shouldStop()) {
       return false;
     }
@@ -956,11 +985,29 @@
 
   function isCalendarStripCellSelected(cell) {
     const aria = cell.getAttribute("aria-selected") || cell.getAttribute("aria-current");
-    const cls = String(cell.className || "") + " " + String((cell.parentElement && cell.parentElement.className) || "");
+    if (aria === "true") return true;
+    // Only check the cell's OWN class — parent classes are too broad
+    // (parent containers carry "active" even for non-selected children)
+    const cls = String(cell.className || "");
+    if (/selected|current|highlight/i.test(cls)) return true;
+    // Check for "-active" class specifically (Cathay pattern), but not plain "active" substring
+    if (/\b-active\b/.test(cls)) return true;
+    // Only count as "selected" if the background is dark and opaque.
+    // The selected day has a dark blue/navy bg; unselected cells have
+    // transparent or white backgrounds.
     const bg = window.getComputedStyle(cell).backgroundColor;
-    return aria === "true" ||
-      /selected|active|current|highlight/i.test(cls) ||
-      (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && bg !== "rgb(255, 255, 255)");
+    if (!bg || bg === "transparent") return false;
+    const m = bg.match(/rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\s*\)/);
+    if (m) {
+      // Check alpha — rgba(0,0,0,0) is transparent, not dark
+      const alpha = m[4] !== undefined ? parseFloat(m[4]) : 1;
+      if (alpha < 0.1) return false;
+      const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+      // Dark background = selected (luminance < 128)
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      return lum < 128;
+    }
+    return false;
   }
 
   /**
@@ -968,12 +1015,23 @@
    */
   function getSelectedStripDay() {
     const cells = getOrderedStripCells();
-    const sel = cells.find((entry) => entry.selected);
-    return sel ? sel.day : -1;
+    const selectedCells = cells.filter((entry) => entry.selected);
+    if (selectedCells.length === 1) return selectedCells[0].day;
+    if (selectedCells.length === 0) return -1;
+    // Multiple cells appear selected — use header date to disambiguate
+    const headerDate = getCurrentResultsDate();
+    if (headerDate) {
+      const headerDay = Number(headerDate.slice(8, 10));
+      const match = selectedCells.find((entry) => entry.day === headerDay);
+      if (match) return match.day;
+    }
+    // Fall back to last selected (rightmost = most recently clicked)
+    return selectedCells[selectedCells.length - 1].day;
   }
 
   function getOrderedStripCells() {
     const bestByDay = new Map();
+    const diagCells = []; // diagnostic: log bg colors
     for (const cell of getVisibleCalendarCells()) {
       const text = normalizeText(cell.innerText);
       const dayMatch = text.match(/\b(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{1,2})\b/i) || text.match(/\b(\d{1,2})\b/);
@@ -985,15 +1043,21 @@
       const area = rect.width * rect.height;
       const existing = bestByDay.get(day);
       if (!existing || area < existing.area) {
+        const bg = window.getComputedStyle(cell).backgroundColor;
+        const sel = isCalendarStripCellSelected(cell);
+        diagCells.push(`d${day}:${bg}:${sel ? "SEL" : "no"}`);
         bestByDay.set(day, {
           day,
           cell,
           text,
           area,
           left: rect.left,
-          selected: isCalendarStripCellSelected(cell),
+          selected: sel,
         });
       }
+    }
+    if (diagCells.length) {
+      console.log("[CX Helper] DIAG strip cell bg:", diagCells);
     }
     return Array.from(bestByDay.values()).sort((a, b) => a.left - b.left);
   }
@@ -1003,11 +1067,18 @@
     if (!cells.length) {
       return [];
     }
-    let selectedIndex = cells.findIndex((entry) => entry.selected);
     const baseDate = baseDateText || getCurrentResultsDate();
-    if (selectedIndex === -1 && baseDate) {
+    // Find the anchor cell: prefer the cell whose day number matches the
+    // baseDate day, then fall back to the first selected cell.  This avoids
+    // the bug where multiple cells appear "selected" and the wrong one is
+    // used as anchor, causing all snapshot dates to shift.
+    let selectedIndex = -1;
+    if (baseDate) {
       const baseDay = Number(baseDate.slice(8, 10));
       selectedIndex = cells.findIndex((entry) => entry.day === baseDay);
+    }
+    if (selectedIndex === -1) {
+      selectedIndex = cells.findIndex((entry) => entry.selected);
     }
     if (selectedIndex === -1 || !baseDate) {
       return cells.map((entry) => Object.assign({}, entry, {
@@ -1079,6 +1150,13 @@
   }
 
   function getCurrentResultsDate() {
+    // Pattern 0: URL-based — most reliable, no DOM dependency
+    const urlMatch = window.location.href.match(/[?&]date=(\d{4}-\d{2}-\d{2})/);
+    if (urlMatch) return urlMatch[1];
+    // Also try URL path patterns like /20261105/
+    const pathMatch = window.location.href.match(/\/(\d{4})(\d{2})(\d{2})\//);
+    if (pathMatch) return `${pathMatch[1]}-${pathMatch[2]}-${pathMatch[3]}`;
+
     const blocks = findVisibleElements("div, span, p, h1, h2, h3");
     for (const el of blocks) {
       const text = normalizeText(el.innerText);
@@ -1101,13 +1179,21 @@
         }
       }
     }
-    // Pattern 3: Look for any standalone date like "30 Nov 2026" near the top of the page
+    // Pattern 3: Look for any standalone date like "30 Nov 2026" near the top
     for (const el of blocks) {
       const rect = el.getBoundingClientRect();
-      if (rect.top > 200) continue; // Only check top area
+      if (rect.top > 400) continue; // Allow up to 400px from top
       const text = normalizeText(el.innerText);
       if (/^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(text)) {
         return parseHumanDate(text);
+      }
+    }
+    // Pattern 4: Find "Departing" anywhere in text, then parse date from same block
+    for (const el of blocks) {
+      const text = normalizeText(el.innerText);
+      if (text.length < 80 && /Departing/i.test(text)) {
+        const parsed = parseHumanDate(text);
+        if (parsed) return parsed;
       }
     }
     return "";
@@ -1560,33 +1646,84 @@
     return hitsA.length >= hitsB.length ? hitsA : hitsB;
   }
 
-  function extractFallbackMilesFromVisibleResults() {
-    const stripCells = getOrderedStripCells();
-    const selectedCell = stripCells.find((entry) => entry.selected);
-    const selectedText = normalizeText(selectedCell ? selectedCell.text : "");
-    const selectedMatch = selectedText.match(/(\d{2,3}[,.]?\d{3})/);
-    if (selectedMatch) {
-      return Number(selectedMatch[1].replace(/[,.]/g, "")).toLocaleString();
+  function extractMilesValue(text) {
+    const matches = normalizeText(text || "").match(/(\d{2,3}[,.]?\d{3})/g);
+    if (!matches) {
+      return "";
     }
-
-    for (const tile of findVisibleCabinTiles().values()) {
-      const text = normalizeText(tile && tile.text);
-      const match = text.match(/(\d{2,3}[,.]?\d{3})/);
-      if (match) {
-        return Number(match[1].replace(/[,.]/g, "")).toLocaleString();
+    for (let i = matches.length - 1; i >= 0; i -= 1) {
+      const numeric = Number(matches[i].replace(/[,.]/g, ""));
+      if (numeric >= 10000 && numeric <= 999000) {
+        return numeric.toLocaleString();
       }
     }
     return "";
   }
 
-  function applyFallbackMiles(itineraries) {
+  function extractMilesFromCabinTile(tile) {
+    if (!tile || !tile.el) {
+      return "";
+    }
+    let node = tile.el;
+    for (let depth = 0; depth < 4 && node; depth += 1) {
+      const rect = node.getBoundingClientRect();
+      const text = normalizeText(node.innerText);
+      if (rect.width > 0 && rect.height > 0 &&
+          rect.width <= 900 && rect.height <= 320 &&
+          matchesCabinTileText(text, tile.code)) {
+        const miles = extractMilesValue(text);
+        if (miles) {
+          return miles;
+        }
+      }
+      node = node.parentElement;
+    }
+    return "";
+  }
+
+  function extractFallbackMilesFromVisibleResults(cabinCode) {
+    const currentDate = getCurrentResultsDate();
+    if (currentDate) {
+      const snapshot = getVisibleStripSnapshot(currentDate);
+      const currentEntry = snapshot.find((entry) => entry.date === currentDate);
+      const currentMiles = extractMilesValue(currentEntry && currentEntry.text);
+      if (currentMiles) {
+        return currentMiles;
+      }
+    }
+
+    const stripCells = getOrderedStripCells();
+    const selectedCell = stripCells.find((entry) => entry.selected);
+    const selectedMiles = extractMilesValue(selectedCell && selectedCell.text);
+    if (selectedMiles) {
+      return selectedMiles;
+    }
+
+    if (cabinCode) {
+      const cabinTile = findVisibleCabinTiles().get(cabinCode);
+      const cabinMiles = extractMilesFromCabinTile(cabinTile);
+      if (cabinMiles) {
+        return cabinMiles;
+      }
+    }
+
+    for (const tile of findVisibleCabinTiles().values()) {
+      const miles = extractMilesFromCabinTile(tile);
+      if (miles) {
+        return miles;
+      }
+    }
+    return "";
+  }
+
+  function applyFallbackMiles(itineraries, cabinCode) {
     if (!Array.isArray(itineraries) || !itineraries.length) {
       return itineraries;
     }
     if (itineraries.some((item) => item.miles)) {
       return itineraries;
     }
-    const fallbackMiles = extractFallbackMilesFromVisibleResults();
+    const fallbackMiles = extractFallbackMilesFromVisibleResults(cabinCode);
     if (!fallbackMiles) {
       return itineraries;
     }
@@ -1618,8 +1755,7 @@
         "text:", JSON.stringify(t.slice(0, 300)));
     }
 
-    const hits = [];
-    const seen = new Set();
+    const bestByFlight = new Map();
     const candidates = flightRelated.slice().sort((a, b) => {
       const ra = a.getBoundingClientRect();
       const rb = b.getBoundingClientRect();
@@ -1632,16 +1768,29 @@
       const uniqueFlights = [...new Set(flightNumbers)];
       if (uniqueFlights.length !== 1) continue;
       const flight = uniqueFlights[0];
-      if (seen.has(flight)) continue;
       const times = text.match(/\d{1,2}:\d{2}/g) || [];
       if (times.length === 0) continue;
       if (hasNoRedemptionSeatsText(text)) continue;
       const stopMatch = text.match(/(\d+)\s+stop/i);
       if (stopMatch && Number(stopMatch[1]) > 0) continue;
-      seen.add(flight);
-      hits.push(extractFlightDetails(flight, text));
+      const details = extractFlightDetails(flight, text);
+      const rect = el.getBoundingClientRect();
+      const candidate = {
+        details,
+        area: rect.width * rect.height,
+        textLength: text.length,
+      };
+      const previous = bestByFlight.get(flight);
+      if (!previous ||
+          Number(Boolean(candidate.details.miles)) > Number(Boolean(previous.details.miles)) ||
+          (candidate.details.miles === previous.details.miles && candidate.textLength > previous.textLength) ||
+          (candidate.details.miles === previous.details.miles &&
+            candidate.textLength === previous.textLength &&
+            candidate.area < previous.area)) {
+        bestByFlight.set(flight, candidate);
+      }
     }
-    return hits;
+    return Array.from(bestByFlight.values()).map((candidate) => candidate.details);
   }
 
   /** Strategy B: Parse the entire page text for flight patterns */
@@ -1695,10 +1844,7 @@
     const durationMatch = text.match(/(\d{1,2}h\s*\d{1,2}m)/);
     const duration = durationMatch ? durationMatch[1] : "";
 
-    // Extract miles - look for Asia Miles format "A75,000" first, then generic numbers
     let miles = "";
-
-    // Priority 1: "A" prefix miles (e.g. "A75,000" or "A 75,000")
     const asiaMilesMatch = text.match(/A\s*(\d{2,3}[,.]?\d{3})/g);
     if (asiaMilesMatch) {
       for (const am of asiaMilesMatch) {
@@ -1710,18 +1856,10 @@
         }
       }
     }
-
-    // Priority 2: Generic large numbers (fallback)
     if (!miles) {
-      const milesMatch = text.match(/(\d{2,3}[,.]?\d{3})/g);
-      if (milesMatch) {
-        const mileCandidates = milesMatch.filter((m) => {
-          const num = Number(m.replace(/[,.]/g, ""));
-          return num >= 10000 && num <= 999000;
-        });
-        if (mileCandidates.length > 0) {
-          miles = mileCandidates[mileCandidates.length - 1].replace(/[,.]/g, "");
-        }
+      const extractedMiles = extractMilesValue(text);
+      if (extractedMiles) {
+        miles = extractedMiles.replace(/[,.]/g, "");
       }
     }
 
@@ -1776,10 +1914,10 @@
     return false;
   }
 
-  async function waitForFlightCards(maxWaitMs) {
+  async function waitForFlightCards(maxWaitMs, minInitialWaitMs) {
     const totalWait = maxWaitMs || 15000;
-    // Wait at least 3 seconds before even checking - give the page time to render
-    const minWaitMs = Math.min(3000, totalWait);
+    // minInitialWaitMs: use 3000 for fresh page loads, 1000 for strip date clicks
+    const minWaitMs = Math.min(minInitialWaitMs || 3000, totalWait);
     console.log("[CX Helper] waitForFlightCards: waiting", minWaitMs, "ms minimum, up to", totalWait, "ms total");
     await sleep(minWaitMs);
 
@@ -1791,16 +1929,15 @@
         return false;
       }
       // Check if any CX flight numbers with times are visible
-      // Use full body text as primary check (more reliable than individual element scanning)
       const bodyText = document.body ? document.body.innerText : "";
       const hasFlights = /\bCX\d{2,4}\b/.test(bodyText) && /\d{1,2}:\d{2}/.test(bodyText) &&
         /Flight details/i.test(bodyText);
 
       if (hasFlights) {
         if (!foundOnce) {
-          console.log("[CX Helper] Flight cards appearing, waiting 2s for stabilization...");
+          console.log("[CX Helper] Flight cards appearing, waiting 1s for stabilization...");
           foundOnce = true;
-          await sleep(2000);
+          await sleep(1000);
           continue;
         }
         console.log("[CX Helper] Flight cards stable and ready");
@@ -1808,9 +1945,7 @@
       }
 
       // Only check for "no flights" messages AFTER we've waited a reasonable amount
-      // (don't check immediately - the page might show these briefly during loading)
       if (Date.now() > deadline - (totalWait - minWaitMs - 5000)) {
-        // We've waited at least 5+ seconds total, safe to check for "no flights"
         if (hasExplicitNoFlightsMessage()) {
           console.log("[CX Helper] 'No flights available' message detected");
           return true;
@@ -1821,7 +1956,7 @@
         }
       }
 
-      await sleep(1000);
+      await sleep(800);
     }
     console.log("[CX Helper] Timed out waiting for flight cards after", totalWait, "ms");
     return false;
@@ -1871,7 +2006,7 @@
     // Don't check cabin - it's already set from homepage search.
     // Don't check for "no flights" message here - just go straight to extraction.
 
-    const itineraries = applyFallbackMiles(parseVisibleItineraries());
+    const itineraries = applyFallbackMiles(parseVisibleItineraries(), cabinCode);
     if (itineraries.length === 0) {
       // Extra diagnostics: dump the page text around CX references
       const allText = document.body ? document.body.innerText : "";
@@ -1940,8 +2075,29 @@
     if (!tbody) {
       return;
     }
+    const meta = document.querySelector(`#${PANEL_ID} .cxah-results-meta`);
     const run = loadRun();
     state.results = run && Array.isArray(run.results) ? run.results : [];
+    if (meta) {
+      const totalFlights = state.results.reduce((count, row) => {
+        if (!row.available || !Array.isArray(row.itineraries)) {
+          return count;
+        }
+        return count + row.itineraries.length;
+      }, 0);
+      const parts = [];
+      const elapsedText = getRunElapsedText(run);
+      if (elapsedText) {
+        parts.push(`${run && run.active ? "Running" : "Elapsed"}: ${elapsedText}`);
+      }
+      if (state.results.length) {
+        parts.push(`${state.results.length} result${state.results.length === 1 ? "" : "s"}`);
+      }
+      if (totalFlights) {
+        parts.push(`${totalFlights} flight${totalFlights === 1 ? "" : "s"}`);
+      }
+      meta.textContent = parts.join(" • ");
+    }
     tbody.innerHTML = "";
     for (const row of state.results) {
       if (!row.available || !row.itineraries || row.itineraries.length === 0) {
@@ -2046,45 +2202,53 @@
     }
 
     // ALWAYS click the target day cell to make sure it's selected.
-    // Don't rely on heuristics about whether it's "already selected" -
-    // just click it. This is safe because clicking an already-selected day is a no-op.
+    // Try the pressable button inside first (React Aria), then the cell itself.
     console.log("[CX Helper] Clicking strip day", targetDay);
+    const pressable = found.cell.querySelector("[data-react-aria-pressable]") ||
+      found.cell.querySelector("button, a, [role='button']");
+    if (pressable && pressable !== found.cell) {
+      console.log("[CX Helper] Clicking pressable inner element:", pressable.tagName);
+      forceClick(pressable);
+    }
     forceClick(found.cell);
-    await sleep(2000);
+    await sleep(1000);
     if (shouldStop()) {
       return "failed";
     }
 
-    // Also try clicking the inner button/link if the cell is a container
-    const inner = found.cell.querySelector("button, a, [role='button']");
-    if (inner) {
-      console.log("[CX Helper] Also clicking inner element:", inner.tagName);
-      forceClick(inner);
-      await sleep(1000);
-      if (shouldStop()) {
-        return "failed";
-      }
-    }
-
     // Wait for flight content to load/update after clicking the day
-    await waitForFlightCards(12000);
+    await waitForFlightCards(8000, 1000);
 
     // --- Date verification: confirm the strip actually selected the target day ---
+    // Use BOTH strip selection and header date for verification.
     const verifiedDay = getSelectedStripDay();
-    console.log("[CX Helper] Post-click verification: selectedDay=", verifiedDay, "targetDay=", targetDay);
+    const headerDateAfter = getCurrentResultsDate();
+    const headerDay = headerDateAfter ? Number(headerDateAfter.slice(8, 10)) : -1;
+    console.log("[CX Helper] Post-click verification: selectedDay=", verifiedDay,
+      "headerDay=", headerDay, "targetDay=", targetDay);
+    // Accept if EITHER strip or header confirms the target day
+    if ((verifiedDay === targetDay) || (headerDay === targetDay)) {
+      return "ok";
+    }
     if (verifiedDay !== -1 && verifiedDay !== targetDay) {
-      console.log("[CX Helper] DATE MISMATCH after click! Strip shows day", verifiedDay, "but target is", targetDay, "- retrying click...");
+      console.log("[CX Helper] DATE MISMATCH after click! Strip shows day", verifiedDay, "header shows day", headerDay, "but target is", targetDay, "- retrying click...");
       // Retry: re-find the cell and click again
       const retry = findStripCellForDay(targetDay);
       if (retry) {
         forceClick(retry.cell);
-        await sleep(2500);
+        await sleep(1000);
         const retryInner = retry.cell.querySelector("button, a, [role='button']");
         if (retryInner) forceClick(retryInner);
-        await sleep(1500);
-        await waitForFlightCards(12000);
+        await sleep(800);
+        await waitForFlightCards(8000, 1000);
         const verifiedDay2 = getSelectedStripDay();
-        console.log("[CX Helper] Retry verification: selectedDay=", verifiedDay2, "targetDay=", targetDay);
+        const headerDate2 = getCurrentResultsDate();
+        const headerDay2 = headerDate2 ? Number(headerDate2.slice(8, 10)) : -1;
+        console.log("[CX Helper] Retry verification: selectedDay=", verifiedDay2,
+          "headerDay=", headerDay2, "targetDay=", targetDay);
+        if ((verifiedDay2 === targetDay) || (headerDay2 === targetDay)) {
+          return "ok";
+        }
         if (verifiedDay2 !== -1 && verifiedDay2 !== targetDay) {
           console.log("[CX Helper] DATE STILL MISMATCHED after retry. selectedDay=", verifiedDay2, "targetDay=", targetDay);
           return "failed";
@@ -2172,16 +2336,19 @@
 
   async function clickStripSnapshotEntry(entry, run) {
     console.log("[CX Helper] Clicking strip entry for", entry.date, "text:", entry.text);
-    forceClick(entry.cell);
-    const inner = entry.cell.querySelector("button, a, [role='button']");
-    if (inner) {
-      forceClick(inner);
+    // Try pressable inner element first (React Aria), then the cell
+    const pressable = entry.cell.querySelector("[data-react-aria-pressable]") ||
+      entry.cell.querySelector("button, a, [role='button']");
+    if (pressable && pressable !== entry.cell) {
+      forceClick(pressable);
     }
-    await sleep(getRunDelayMs(run, 1.5, 2500));
+    forceClick(entry.cell);
+    await sleep(getRunDelayMs(run, 0.75, 1500));
     if (shouldStop()) {
       return;
     }
-    await waitForFlightCards(12000);
+    // Use shorter min wait — page is already loaded, just switching dates
+    await waitForFlightCards(10000, 1000);
   }
 
   async function collectResultsForCurrentDate(run, dateText) {
@@ -2193,18 +2360,22 @@
     // --- Pre-extraction date verification ---
     const targetDay = Number(dateText.slice(8, 10));
     const displayedDay = getSelectedStripDay();
-    if (displayedDay !== -1 && displayedDay !== targetDay) {
-      console.log("[CX Helper] collectResults: DATE MISMATCH! Page shows day", displayedDay,
-        "but we intend to extract for", dateText, "(day", targetDay, "). Re-selecting...");
+    const headerDate = getCurrentResultsDate();
+    const headerDay = headerDate ? Number(headerDate.slice(8, 10)) : -1;
+    // Accept if either strip selection or header date matches target
+    const dateOk = (displayedDay === targetDay) || (headerDay === targetDay);
+    if (!dateOk && displayedDay !== -1) {
+      console.log("[CX Helper] collectResults: DATE MISMATCH! Strip day=", displayedDay,
+        "header day=", headerDay, "but target=", dateText, "(day", targetDay, "). Re-selecting...");
       const fixStatus = await ensureResultsDateSelected(dateText);
       if (fixStatus === "failed") {
         console.log("[CX Helper] collectResults: Could not fix date mismatch for", dateText, "- skipping");
-        return;
+        return "failed";
       }
       if (fixStatus === "unavailable") {
         upsertRunResult(run, buildUnavailableResult(dateText, seedCabin));
         saveRunAndRender(run);
-        return;
+        return "ok";
       }
     }
 
@@ -2276,9 +2447,12 @@
     if (!Array.isArray(snapshot) || snapshot.length === 0) {
       return null;
     }
-    return snapshot.find((entry) => entry.selected && entry.date) ||
-      snapshot.find((entry) => entry.date === preferredDate) ||
-      null;
+    // Prefer the entry matching the date we just clicked/navigated to
+    if (preferredDate) {
+      const preferred = snapshot.find((entry) => entry.date === preferredDate);
+      if (preferred) return preferred;
+    }
+    return snapshot.find((entry) => entry.selected && entry.date) || null;
   }
 
   async function processSeedCabinFromResultsPage(run) {
@@ -2286,6 +2460,7 @@
     const targetDate = addDays(run.startDate, run.offset || 0);
     let currentFocusDate = targetDate;
     let windowMoves = 0;
+    const dateClickFailures = new Map(); // date → failure count (loop protection)
 
     setStatus(`Checking ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)} (${Math.max(1, getDateOffset(run, targetDate) + 1)}/${run.days})...`);
 
@@ -2325,11 +2500,20 @@
       if (activeEntry && isDateWithinRun(run, activeEntry.date) && !activeEntry.unavailable && hasPendingVisibleCabinResults(run, activeEntry.date)) {
         const progress = Math.max(1, getDateOffset(run, activeEntry.date) + 1);
         setStatus(`Checking ${formatDisplayDate(activeEntry.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
-        await collectResultsForCurrentDate(run, activeEntry.date);
+        const collectStatus = await collectResultsForCurrentDate(run, activeEntry.date);
+        if (collectStatus === "failed") {
+          const prev = dateClickFailures.get(activeEntry.date) || 0;
+          dateClickFailures.set(activeEntry.date, prev + 1);
+          console.log("[CX Helper] Date click failure count for", activeEntry.date, ":", prev + 1);
+        }
         snapshot = markVisibleUnavailableDates(run, seedCabin, getCurrentResultsDate() || activeEntry.date);
       }
 
-      const nextPending = snapshot.find((entry) => entry.date && isDateWithinRun(run, entry.date) && !hasRunResult(run, entry.date, seedCabin));
+      const nextPending = snapshot.find((entry) =>
+        entry.date && isDateWithinRun(run, entry.date) &&
+        !hasRunResult(run, entry.date, seedCabin) &&
+        (dateClickFailures.get(entry.date) || 0) < 2 // skip dates that repeatedly fail
+      );
       if (nextPending) {
         console.log("[CX Helper] Next pending date in strip:", nextPending.date, nextPending.text);
         if (nextPending.unavailable) {
@@ -2396,18 +2580,14 @@
         console.log("[CX Helper] Completed results-page pass for seed cabin", seedCabin);
       }
       if (hasFinishedAllResults(run)) {
-        run.active = false;
-        run.phase = "done";
-        saveRunAndRender(run);
+        finalizeRun(run, "done");
         setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
         return;
       }
 
       const nextPending = findNextPendingSeed(run);
       if (!nextPending) {
-        run.active = false;
-        run.phase = "done";
-        saveRunAndRender(run);
+        finalizeRun(run, "done");
         setStatus(`Finished ${run.results.length} date/cabin result${run.results.length === 1 ? "" : "s"}.`);
         return;
       }
@@ -2421,8 +2601,7 @@
       navigateToHomepage(run, `Returning to homepage for ${formatDisplayDate(nextPending.dateText)} ${getCabinLabel(nextPending.cabinCode)}...`);
     } catch (error) {
       console.log("[CX Helper] continueRunFromResultsPage FATAL error:", error.message, error.stack);
-      run.active = false;
-      saveRun(run);
+      finalizeRun(run, "stopped");
       setStatus(`Stopped: ${error.message}`);
     } finally {
       state.running = false;
@@ -2452,13 +2631,14 @@
       adults: settings.adults,
       cabinCodes: settings.cabins,
       seedCabin: settings.cabins[0],
-      directOnly: settings.directOnly,
-      delayMs: (settings.delayS || DEFAULT_DELAY_S) * 1000,
+      directOnly: true,
+      delayMs: DEFAULT_DELAY_S * 1000,
       origin: settings.origin,
       destination: settings.destination,
       settings: settings, // preserve form values across cross-origin navigation
       results: [],
       startedAt: new Date().toISOString(),
+      completedAt: "",
     };
   }
 
@@ -3042,9 +3222,7 @@
   function stopRun() {
     const run = loadRun();
     if (run) {
-      run.active = false;
-      run.phase = "stopped";
-      saveRun(run);
+      finalizeRun(run, "stopped");
     }
     state.running = false;
     state.stopping = true;
@@ -3247,22 +3425,10 @@
         color: #d8e8e4;
         font-weight: 600;
       }
-      #${PANEL_ID} .cxah-toggle-row {
-        grid-column: 1 / -1;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 2px 0 4px;
-      }
-      #${PANEL_ID} .cxah-toggle-row input[type="checkbox"] {
-        width: auto;
-        margin: 0;
-        accent-color: #34827b;
-      }
-      #${PANEL_ID} .cxah-toggle-row label {
-        margin: 0;
-        font-size: 13px;
-        color: #f3f0e8;
+      #${PANEL_ID} .cxah-results-meta {
+        padding: 0 14px 8px;
+        color: #c5ddd8;
+        font-size: 12px;
       }
       #${PANEL_ID} .cxah-cabin-group {
         grid-column: 1 / -1;
@@ -3388,7 +3554,6 @@
 
     const panel = document.createElement("section");
     panel.id = PANEL_ID;
-    const delayVal = settings.delayS || DEFAULT_DELAY_S;
     const selectedCabins = getRunCabinCodes(settings);
     const cabinIds = getCabinCheckboxIds();
     panel.innerHTML = `
@@ -3455,14 +3620,6 @@
             <label for="cxah-adults">Adults</label>
             <input id="cxah-adults" type="number" min="1" max="4" value="${settings.adults}" />
           </div>
-          <div>
-            <label for="cxah-delay">Delay (sec)</label>
-            <input id="cxah-delay" type="number" min="1" max="30" step="1" value="${delayVal}" />
-          </div>
-          <div class="cxah-toggle-row">
-            <input id="cxah-direct-only" type="checkbox" ${settings.directOnly !== false ? "checked" : ""} />
-            <label for="cxah-direct-only">Direct flights only</label>
-          </div>
         </div>
         <div class="cxah-actions">
           <button type="button" class="cxah-run" id="cxah-run">Search date range</button>
@@ -3472,6 +3629,7 @@
           <button type="button" id="cxah-clear-run">Clear current run</button>
         </div>
         <div class="cxah-status">${state.status}</div>
+        <div class="cxah-results-meta"></div>
         <div class="cxah-table-wrap">
           <table>
             <thead>
@@ -3589,8 +3747,7 @@
           await sleep(1500);
         }
         console.log("[CX Helper] Homepage never loaded, stopping");
-        run.active = false;
-        saveRun(run);
+        finalizeRun(run, "stopped");
         setStatus("Stopped: Homepage did not load after returning from results.");
         return;
       }

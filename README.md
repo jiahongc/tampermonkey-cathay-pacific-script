@@ -8,14 +8,14 @@ A Tampermonkey userscript that automates Cathay Pacific award flight searches ac
 - Multi-select cabins (First / Business / Premium Economy / Economy)
 - Automatically set the homepage cabin class and passenger count for each required seed search
 - Swap button to quickly reverse origin and destination with one click
-- Filter to direct CX (Cathay Pacific) flights only
+- Keep searches focused on direct CX (Cathay Pacific) flights only
 - Extract flight details: flight number, departure/arrival times, duration, miles required
 - Reuse the results page efficiently by harvesting visible `Not available` dates from the date strip
 - Advance through later dates with the results-page right arrow instead of restarting from the homepage each time
 - Reuse in-page cabin toggles when a searched cabin exposes additional selected cabins
 - Automatically dismiss the results-page "no available flights for that date" modal and continue scanning
 - Automatically recover from Cathay's transient `Error (3002)` page by returning to the homepage and resuming the run
-- Delay setting now paces homepage submissions, result-page date hops, and adds a longer cooldown after 3002 recovery
+- Built-in pacing now handles homepage submissions, result-page date hops, and longer cooldowns after 3002 recovery
 - Dual-strategy flight parsing (DOM-based + text-based) for reliable data extraction
 - Falls back to visible strip/tile pricing when flights parse correctly but miles are missing from the card text
 - Results displayed in a collapsible panel overlay
@@ -54,7 +54,7 @@ Install directly from [Greasy Fork](https://greasyfork.org/en/scripts/568672-cat
 5. Click **Search date range** to start the automated search
 6. The script will automatically set the homepage seed cabin and passengers, then continue most traversal from the results page
 7. Use the **Stop** button to halt at any time
-8. Results appear in the panel table with Date, Cabin, Flight, Time, Duration, and Miles columns
+8. Results appear in the panel table with Date, Cabin, Flight, Time, Duration, and Miles columns, with elapsed run time shown above the table
 9. If something behaves unexpectedly, install the debug version and use the **Copy logs** button to share the `[CX Helper]` logs
 
 ## How It Works
