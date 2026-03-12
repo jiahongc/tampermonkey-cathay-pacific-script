@@ -5,6 +5,7 @@ A Tampermonkey userscript that automates Cathay Pacific award flight searches ac
 ## Features
 
 - Search for award availability across multiple dates automatically
+- Two date selection modes: **consecutive days** (start date + N days) or **specific dates** via a visual calendar grid picker
 - Multi-select cabins (First / Business / Premium Economy / Economy)
 - Automatically set the homepage cabin class and passenger count for each required seed search
 - Swap button to quickly reverse origin and destination with one click
@@ -50,12 +51,15 @@ Install directly from [Greasy Fork](https://greasyfork.org/en/scripts/568672-cat
 1. Go to [cathaypacific.com](https://www.cathaypacific.com/)
 2. The helper panel appears in the top-right corner
 3. Select a route preset or enter custom origin/destination — use the **⇄** button to swap them
-4. Fill in the start date, number of days, one or more cabins, and number of adults
-5. Click **Search date range** to start the automated search
-6. The script will automatically set the homepage seed cabin and passengers, then continue most traversal from the results page
-7. Use the **Stop** button to halt at any time
-8. Results appear in the panel table with Date, Cabin, Flight, Time, Duration, and Miles columns, with elapsed run time shown above the table
-9. If something behaves unexpectedly, install the debug version and use the **Copy logs** button to share the `[CX Helper]` logs
+4. Choose a date selection mode:
+   - **Consecutive days** — enter a start date and number of days
+   - **Specific dates** — switch to the calendar grid and click individual dates (up to 14)
+5. Select one or more cabins and number of adults
+6. Click **Search date range** to start the automated search
+7. The script will automatically set the homepage seed cabin and passengers, then continue most traversal from the results page
+8. Use the **Stop** button to halt at any time
+9. Results appear in the panel table with Date, Cabin, Flight, Time, Duration, and Miles columns, with elapsed run time shown above the table
+10. If something behaves unexpectedly, install the debug version and use the **Copy logs** button to share the `[CX Helper]` logs
 
 ## How It Works
 

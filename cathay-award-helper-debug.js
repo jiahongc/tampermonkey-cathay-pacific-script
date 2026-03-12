@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cathay Award Helper (Debug)
 // @namespace    codex.local
-// @version      0.3.0
+// @version      0.5.0
 // @description  Automate Cathay award searches from the homepage and keep only nonstop matches.
 // @author       jiahongc
 // @license      MIT
@@ -34,6 +34,8 @@
     cabins: ["PY"],
     directOnly: true,
     delayS: DEFAULT_DELAY_S,
+    dateMode: "consecutive",
+    specificDates: [],
     // Legacy compat: delayMs is converted to delayS on load
   };
   const ROUTE_PRESETS = [
@@ -215,6 +217,8 @@
     merged.cabin = merged.cabins[0];
     merged.directOnly = true;
     merged.delayS = DEFAULT_DELAY_S;
+    if (!merged.dateMode) merged.dateMode = "consecutive";
+    if (!Array.isArray(merged.specificDates)) merged.specificDates = [];
     delete merged.delayMs;
     delete merged.cabinPreset;
     return merged;
@@ -418,18 +422,106 @@
     };
   }
 
+  function getRunDates(run) {
+    if (run.dateMode === "specific" && Array.isArray(run.specificDates) && run.specificDates.length) {
+      return run.specificDates.slice().sort();
+    }
+    const dates = [];
+    for (let i = 0; i < (run.days || 1); i++) {
+      dates.push(addDays(run.startDate, i));
+    }
+    return dates;
+  }
+
   function getRunLastDate(run) {
-    return addDays(run.startDate, Math.max(0, (run.days || 1) - 1));
+    const dates = getRunDates(run);
+    return dates[dates.length - 1];
   }
 
   function isDateWithinRun(run, dateText) {
-    return Boolean(dateText) && dateText >= run.startDate && dateText <= getRunLastDate(run);
+    return Boolean(dateText) && getRunDates(run).includes(dateText);
   }
 
   function getDateOffset(run, dateText) {
-    const start = new Date(`${run.startDate}T00:00:00`);
-    const end = new Date(`${dateText}T00:00:00`);
-    return Math.round((end - start) / 86400000);
+    return getRunDates(run).indexOf(dateText);
+  }
+
+  // --- Calendar grid state ---
+  let calendarSelectedDates = new Set();
+  let calendarViewYear = new Date().getFullYear();
+  let calendarViewMonth = new Date().getMonth(); // 0-indexed
+
+  function renderCalendar() {
+    const container = getField("cxah-calendar");
+    if (!container) return;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const year = calendarViewYear;
+    const month = calendarViewMonth;
+    const monthName = new Date(year, month, 1).toLocaleString(undefined, { month: "long" });
+    const firstDay = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    let html = `<div class="cxah-cal-hdr">
+      <button type="button" class="cxah-cal-nav" data-dir="-1">\u2039</button>
+      <span>${monthName} ${year}</span>
+      <button type="button" class="cxah-cal-nav" data-dir="1">\u203a</button>
+    </div>
+    <div class="cxah-cal-grid">
+      <div class="cxah-cal-wk">Su</div><div class="cxah-cal-wk">Mo</div><div class="cxah-cal-wk">Tu</div>
+      <div class="cxah-cal-wk">We</div><div class="cxah-cal-wk">Th</div><div class="cxah-cal-wk">Fr</div>
+      <div class="cxah-cal-wk">Sa</div>`;
+
+    for (let i = 0; i < firstDay; i++) {
+      html += `<div class="cxah-cal-day cxah-cal-empty"></div>`;
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateObj = new Date(year, month, d);
+      const dateStr = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const isPast = dateObj < today;
+      const isSelected = calendarSelectedDates.has(dateStr);
+      const classes = ["cxah-cal-day"];
+      if (isPast) classes.push("cxah-cal-past");
+      if (isSelected) classes.push("cxah-cal-selected");
+      html += `<div class="${classes.join(" ")}" data-date="${dateStr}">${d}</div>`;
+    }
+    html += `</div>`;
+    container.innerHTML = html;
+
+    const countEl = getField("cxah-calendar-count");
+    if (countEl) {
+      countEl.textContent = `${calendarSelectedDates.size} / ${MAX_DAYS} dates selected`;
+    }
+  }
+
+  function onCalendarClick(e) {
+    const cell = e.target.closest("[data-date]");
+    if (!cell || cell.classList.contains("cxah-cal-past") || cell.classList.contains("cxah-cal-empty")) return;
+    const dateStr = cell.getAttribute("data-date");
+    if (calendarSelectedDates.has(dateStr)) {
+      calendarSelectedDates.delete(dateStr);
+    } else {
+      if (calendarSelectedDates.size >= MAX_DAYS) return;
+      calendarSelectedDates.add(dateStr);
+    }
+    renderCalendar();
+  }
+
+  function onCalendarNav(e) {
+    const btn = e.target.closest("[data-dir]");
+    if (!btn) return;
+    const dir = Number(btn.getAttribute("data-dir"));
+    calendarViewMonth += dir;
+    if (calendarViewMonth > 11) { calendarViewMonth = 0; calendarViewYear++; }
+    if (calendarViewMonth < 0) { calendarViewMonth = 11; calendarViewYear--; }
+    renderCalendar();
+  }
+
+  function toggleDateModeUI(mode) {
+    const consecutiveWrap = getField("cxah-consecutive-wrap");
+    const calendarWrap = getField("cxah-calendar-wrap");
+    if (consecutiveWrap) consecutiveWrap.style.display = mode === "specific" ? "none" : "";
+    if (calendarWrap) calendarWrap.style.display = mode === "specific" ? "" : "none";
   }
 
   function readFormSettings() {
@@ -443,6 +535,9 @@
     if (cabins.length === 0) {
       throw new Error("Select at least one cabin.");
     }
+    const dateModeEl = getField("cxah-date-mode");
+    const dateMode = dateModeEl ? dateModeEl.value : "consecutive";
+    const specificDates = dateMode === "specific" ? Array.from(calendarSelectedDates).sort() : [];
     return {
       routePreset,
       origin: getField("cxah-origin").value.trim() || (route && route.origin) || "",
@@ -453,6 +548,8 @@
       cabins: normalizeCabinCodes(cabins),
       directOnly: true,
       delayS: DEFAULT_DELAY_S,
+      dateMode,
+      specificDates,
     };
   }
 
@@ -471,6 +568,13 @@
         el.checked = cabins.includes(code);
       }
     });
+    const dateModeEl = getField("cxah-date-mode");
+    if (dateModeEl) {
+      dateModeEl.value = settings.dateMode || "consecutive";
+    }
+    calendarSelectedDates = new Set(Array.isArray(settings.specificDates) ? settings.specificDates : []);
+    toggleDateModeUI(settings.dateMode || "consecutive");
+    renderCalendar();
   }
 
   function buildOptions(options, selectedValue) {
@@ -588,7 +692,7 @@
     if (!isRecoverableErrorPage()) {
       return false;
     }
-    const dateText = addDays(run.startDate, run.offset || 0);
+    const dateText = getRunDates(run)[run.offset || 0];
     const cabinCode = getSeedCabin(run);
     const retryKey = `${dateText}__${cabinCode}`;
     run.errorRecoveries = run.errorRecoveries || {};
@@ -660,12 +764,12 @@
     if (checkbox) {
       if (checkbox.checked === true) {
         console.log("[CX Helper] Direct flights already checked");
-        return;
+        return false; // no click needed
       }
       console.log("[CX Helper] Clicking Direct flights checkbox");
       forceToggle(checkbox);
       await sleep(1500);
-      return;
+      return true; // clicked
     }
     // Fallback: find the "Direct flights" text and click near it
     const label = findClickableByText(/^Direct flights$/i);
@@ -673,9 +777,10 @@
       console.log("[CX Helper] Clicking Direct flights label");
       forceClick(label);
       await sleep(1500);
-    } else {
-      console.log("[CX Helper] Direct flights checkbox/label not found");
+      return true; // clicked
     }
+    console.log("[CX Helper] Direct flights checkbox/label not found");
+    return false;
   }
 
   /**
@@ -950,7 +1055,7 @@
     }
     console.log("[CX Helper] Clicking cabin tile for", cabinCode, "text:", tileInfo.text);
     clickElement(tileInfo.el);
-    await sleep(1800);
+    await sleep(1000);
     if (shouldStop()) {
       return false;
     }
@@ -1584,18 +1689,33 @@
       console.log("[CX Helper] Clicking next button:", nextBtn.tagName, nextBtn.className,
         "outerHTML:", nextBtn.outerHTML.slice(0, 200),
         "rect:", Math.round(btnRect.left), Math.round(btnRect.top), Math.round(btnRect.width), "x", Math.round(btnRect.height));
-      clickElement(nextBtn);
-      await sleep(800);
-      const afterMonths = getVisibleCalendarMonthHeaders().join(", ");
-      if (afterMonths === beforeMonths) {
-        console.log("[CX Helper] WARNING: Months did not change after clicking next! Before:", beforeMonths, "After:", afterMonths);
-        // Try clicking the element directly with .click()
-        nextBtn.click();
-        await sleep(800);
-        const afterRetry = getVisibleCalendarMonthHeaders().join(", ");
-        if (afterRetry === beforeMonths) {
-          console.log("[CX Helper] Still no change after direct .click(). Aborting.");
-          return false;
+      // Use native .click() first — slick carousel can misbehave with the full
+      // pointer+mouse sequence that forceClick sends
+      nextBtn.click();
+      // Wait for the carousel slide animation to settle and month headers to appear
+      let afterMonths = "";
+      for (let waitRound = 0; waitRound < 8; waitRound++) {
+        await sleep(500);
+        afterMonths = getVisibleCalendarMonthHeaders().join(", ");
+        if (afterMonths && afterMonths !== beforeMonths) break;
+      }
+      if (!afterMonths || afterMonths === beforeMonths) {
+        console.log("[CX Helper] WARNING: Months did not advance after .click(). Before:", beforeMonths, "After:", afterMonths, "- trying forceClick");
+        clickElement(nextBtn);
+        for (let waitRound = 0; waitRound < 6; waitRound++) {
+          await sleep(500);
+          afterMonths = getVisibleCalendarMonthHeaders().join(", ");
+          if (afterMonths && afterMonths !== beforeMonths) break;
+        }
+        if (!afterMonths || afterMonths === beforeMonths) {
+          console.log("[CX Helper] Still no change after forceClick. Before:", beforeMonths, "After:", afterMonths);
+          // Last resort: re-open the calendar and try again
+          const dateFieldRetry = findHomepageDateField();
+          if (dateFieldRetry) {
+            clickElement(dateFieldRetry);
+            await sleep(1200);
+          }
+          continue;
         }
       }
     }
@@ -1935,9 +2055,9 @@
 
       if (hasFlights) {
         if (!foundOnce) {
-          console.log("[CX Helper] Flight cards appearing, waiting 1s for stabilization...");
+          console.log("[CX Helper] Flight cards appearing, waiting 500ms for stabilization...");
           foundOnce = true;
-          await sleep(1000);
+          await sleep(500);
           continue;
         }
         console.log("[CX Helper] Flight cards stable and ready");
@@ -1972,13 +2092,16 @@
     };
   }
 
-  async function inspectCurrentResults(run, dateText, cabinCode) {
+  async function inspectCurrentResults(run, dateText, cabinCode, skipInitialWait) {
     const noAvail = buildUnavailableResult(dateText, cabinCode);
 
     // Wait for flight cards to render after page load / date change
-    await waitForFlightCards(15000);
-    if (shouldStop()) {
-      return noAvail;
+    // skipInitialWait: caller already waited (e.g. clickStripSnapshotEntry / selectCabinOnResults)
+    if (!skipInitialWait) {
+      await waitForFlightCards(15000);
+      if (shouldStop()) {
+        return noAvail;
+      }
     }
 
     if (await dismissNoAvailabilityModalIfPresent()) {
@@ -1996,8 +2119,10 @@
     // The parser already skips connecting flights via the "stop" check.
     if (run.directOnly) {
       try {
-        await ensureDirectFlightsEnabled();
-        await sleep(2000);
+        const clicked = await ensureDirectFlightsEnabled();
+        if (clicked) {
+          await sleep(2000);
+        }
       } catch (e) {
         console.log("[CX Helper] ensureDirectFlightsEnabled error (non-fatal):", e.message);
       }
@@ -2055,8 +2180,9 @@
 
   function findNextPendingSeed(run) {
     const cabins = getRunCabinCodes(run);
-    for (let offset = 0; offset < run.days; offset += 1) {
-      const dateText = addDays(run.startDate, offset);
+    const dates = getRunDates(run);
+    for (let offset = 0; offset < dates.length; offset += 1) {
+      const dateText = dates[offset];
       for (const cabinCode of cabins) {
         if (!hasRunResult(run, dateText, cabinCode)) {
           return { offset, dateText, cabinCode };
@@ -2305,9 +2431,9 @@
   }
 
   function hasCompletedCabinRange(run, cabinCode) {
-    for (let offset = 0; offset < run.days; offset += 1) {
-      const dateText = addDays(run.startDate, offset);
-      if (!hasRunResult(run, dateText, cabinCode)) {
+    const dates = getRunDates(run);
+    for (let offset = 0; offset < dates.length; offset += 1) {
+      if (!hasRunResult(run, dates[offset], cabinCode)) {
         return false;
       }
     }
@@ -2343,7 +2469,7 @@
       forceClick(pressable);
     }
     forceClick(entry.cell);
-    await sleep(getRunDelayMs(run, 0.75, 1500));
+    await sleep(getRunDelayMs(run, 0.5, 1500));
     if (shouldStop()) {
       return;
     }
@@ -2382,7 +2508,7 @@
     if (!hasRunResult(run, dateText, seedCabin)) {
       let result;
       try {
-        result = await inspectCurrentResults(run, dateText, seedCabin);
+        result = await inspectCurrentResults(run, dateText, seedCabin, true);
       } catch (error) {
         console.log("[CX Helper] inspectCurrentResults error for", dateText, seedCabin, error.message);
         result = buildUnavailableResult(dateText, seedCabin);
@@ -2415,7 +2541,7 @@
       currentCabin = cabinCode;
       let result;
       try {
-        result = await inspectCurrentResults(run, dateText, cabinCode);
+        result = await inspectCurrentResults(run, dateText, cabinCode, true);
       } catch (error) {
         console.log("[CX Helper] inspectCurrentResults error for extra cabin", dateText, cabinCode, error.message);
         result = buildUnavailableResult(dateText, cabinCode);
@@ -2457,26 +2583,34 @@
 
   async function processSeedCabinFromResultsPage(run) {
     const seedCabin = getSeedCabin(run);
-    const targetDate = addDays(run.startDate, run.offset || 0);
+    const targetDate = getRunDates(run)[run.offset || 0];
     let currentFocusDate = targetDate;
     let windowMoves = 0;
     const dateClickFailures = new Map(); // date → failure count (loop protection)
 
-    setStatus(`Checking ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)} (${Math.max(1, getDateOffset(run, targetDate) + 1)}/${run.days})...`);
+    setStatus(`Checking ${formatDisplayDate(targetDate)} ${getCabinLabel(seedCabin)} (${Math.max(1, getDateOffset(run, targetDate) + 1)}/${getRunDates(run).length})...`);
 
     try {
       await waitForResultsPageReady(20000);
       const dismissedInitialModal = await dismissNoAvailabilityModalIfPresent();
-      if (dismissedInitialModal && !hasRunResult(run, targetDate, seedCabin)) {
-        upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
-        saveRunAndRender(run);
-      }
-      if (!dismissedInitialModal) {
-        const dateStatus = await ensureResultsDateSelected(targetDate);
-        if (dateStatus === "unavailable" && !hasRunResult(run, targetDate, seedCabin)) {
-          upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
+      if (dismissedInitialModal) {
+        // The modal was for whatever date Cathay landed on, which may differ
+        // from our target (Cathay's API often lands one day before the target).
+        // Record unavailability for the LANDING date, not the target date.
+        const landingDate = getCurrentResultsDate();
+        console.log("[CX Helper] No-availability modal dismissed. Landing date:", landingDate, "target date:", targetDate);
+        if (landingDate && landingDate !== targetDate && isDateWithinRun(run, landingDate) && !hasRunResult(run, landingDate, seedCabin)) {
+          console.log("[CX Helper] Recording unavailable for landing date", landingDate, "(not target", targetDate, ")");
+          upsertRunResult(run, buildUnavailableResult(landingDate, seedCabin));
           saveRunAndRender(run);
         }
+      }
+      // Always navigate to the actual target date in the strip, whether or not
+      // a modal was dismissed (Cathay may have landed on a different date).
+      const dateStatus = await ensureResultsDateSelected(targetDate);
+      if (dateStatus === "unavailable" && !hasRunResult(run, targetDate, seedCabin)) {
+        upsertRunResult(run, buildUnavailableResult(targetDate, seedCabin));
+        saveRunAndRender(run);
       }
     } catch (error) {
       console.log("[CX Helper] Initial date selection error:", error.message);
@@ -2499,7 +2633,7 @@
       console.log("[CX Helper] Active strip focus:", currentFocusDate, activeEntry ? activeEntry.text : "none");
       if (activeEntry && isDateWithinRun(run, activeEntry.date) && !activeEntry.unavailable && hasPendingVisibleCabinResults(run, activeEntry.date)) {
         const progress = Math.max(1, getDateOffset(run, activeEntry.date) + 1);
-        setStatus(`Checking ${formatDisplayDate(activeEntry.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
+        setStatus(`Checking ${formatDisplayDate(activeEntry.date)} ${getCabinLabel(seedCabin)} (${progress}/${getRunDates(run).length})...`);
         const collectStatus = await collectResultsForCurrentDate(run, activeEntry.date);
         if (collectStatus === "failed") {
           const prev = dateClickFailures.get(activeEntry.date) || 0;
@@ -2522,7 +2656,7 @@
           continue;
         }
         const progress = Math.max(1, getDateOffset(run, nextPending.date) + 1);
-        setStatus(`Checking ${formatDisplayDate(nextPending.date)} ${getCabinLabel(seedCabin)} (${progress}/${run.days})...`);
+        setStatus(`Checking ${formatDisplayDate(nextPending.date)} ${getCabinLabel(seedCabin)} (${progress}/${getRunDates(run).length})...`);
         await clickStripSnapshotEntry(nextPending, run);
         currentFocusDate = nextPending.date;
         continue;
@@ -2565,7 +2699,7 @@
     }
     state.running = true;
     const seedCabin = getSeedCabin(run);
-    const targetDate = addDays(run.startDate, run.offset || 0);
+    const targetDate = getRunDates(run)[run.offset || 0];
     console.log("[CX Helper] === continueRunFromResultsPage: target=", targetDate,
       "offset=", run.offset, "days=", run.days, "seedCabin=", seedCabin,
       "cabins=", getRunCabinCodes(run));
@@ -2614,8 +2748,17 @@
       settings = readFormSettings();
       settings.origin = normalizeAirportCode(settings.origin);
       settings.destination = normalizeAirportCode(settings.destination);
-      settings.startDate = normalizeDate(settings.startDate);
       settings.cabins = getRunCabinCodes(settings);
+      if (settings.dateMode === "specific") {
+        if (!settings.specificDates.length) {
+          throw new Error("Select at least one date on the calendar.");
+        }
+        settings.specificDates = settings.specificDates.slice().sort();
+        settings.days = settings.specificDates.length;
+        settings.startDate = settings.specificDates[0];
+      } else {
+        settings.startDate = normalizeDate(settings.startDate);
+      }
       saveSettings(settings);
     } catch (error) {
       setStatus(`Stopped: ${error.message}`);
@@ -2635,6 +2778,8 @@
       delayMs: DEFAULT_DELAY_S * 1000,
       origin: settings.origin,
       destination: settings.destination,
+      dateMode: settings.dateMode,
+      specificDates: settings.specificDates || [],
       settings: settings, // preserve form values across cross-origin navigation
       results: [],
       startedAt: new Date().toISOString(),
@@ -2772,11 +2917,17 @@
       // opens the dropdown list. Then click the target option to select it.
       console.log("[CX Helper] Setting cabin class. Want:", cabinLabel);
 
+      // Exclude offer cards and promotional elements that would navigate away
+      function isBookingPanelElement(el) {
+        const cls = (el.className || "") + " " + (el.closest("[class]") ? el.closest("[class]").className || "" : "");
+        return !/offerCard|fareCard|promo/i.test(cls);
+      }
+
       // Helper: check if dropdown options are visible
       function countVisibleCabinOptions() {
         const opts = findVisibleElements("*").filter((o) => {
           const t = normalizeText(o.innerText);
-          return /^(First|Business|Premium Economy|Economy)$/i.test(t);
+          return /^(First|Business|Premium Economy|Economy)$/i.test(t) && isBookingPanelElement(o);
         });
         return new Set(opts.map((o) => normalizeText(o.innerText)));
       }
@@ -2786,7 +2937,7 @@
       // Primary: click the current cabin value text (SPAN.dropdown__value or similar)
       const valueEls = findVisibleElements("div, span, p").filter((el) => {
         const t = normalizeText(el.innerText);
-        return /^(First|Business|Premium Economy|Economy)$/i.test(t);
+        return /^(First|Business|Premium Economy|Economy)$/i.test(t) && isBookingPanelElement(el);
       });
       valueEls.sort((a, b) => {
         const ra = a.getBoundingClientRect();
@@ -2832,7 +2983,7 @@
         // Click the target cabin option (smallest matching element)
         await sleep(300);
         const optionEls = findVisibleElements("*").filter((el) => {
-          return normalizeText(el.innerText) === cabinLabel;
+          return normalizeText(el.innerText) === cabinLabel && isBookingPanelElement(el);
         });
         optionEls.sort((a, b) => {
           const ra = a.getBoundingClientRect();
@@ -3159,6 +3310,11 @@
         setStatus(`Setting airports: ${run.origin || "?"} → ${run.destination || "?"}...`);
         await setHomepageAirports(run.origin, run.destination);
         if (shouldStop()) return;
+        // Dismiss any lingering airport suggestion dropdown before opening cabin popup
+        if (document.activeElement && document.activeElement.blur) {
+          document.activeElement.blur();
+        }
+        await sleep(1500);
       }
       if (seedCabin || run.adults > 1) {
         setStatus(`Setting cabin and passengers (${getCabinLabel(seedCabin)})...`);
@@ -3172,7 +3328,7 @@
         }
       }
 
-      const targetDate = addDays(run.startDate, run.offset || 0);
+      const targetDate = getRunDates(run)[run.offset || 0];
       setStatus(`Setting homepage date to ${formatDisplayDate(targetDate)} for ${getCabinLabel(seedCabin)}...`);
       console.log("[CX Helper] About to set homepage date to:", targetDate, "seedCabin:", seedCabin);
       const dateReady = await setHomepageDepartingDate(targetDate);
@@ -3491,6 +3647,65 @@
         color: #9fb6b0;
         font-size: 11px;
       }
+      #${PANEL_ID} .cxah-cal-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 6px;
+      }
+      #${PANEL_ID} .cxah-cal-hdr span {
+        font-size: 13px;
+        font-weight: 600;
+        color: #f3f0e8;
+      }
+      #${PANEL_ID} .cxah-cal-nav {
+        width: 28px !important;
+        height: 28px;
+        padding: 0;
+        font-size: 18px;
+        line-height: 1;
+        border-radius: 6px;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid #59716c;
+        color: #f3f0e8;
+        cursor: pointer;
+      }
+      #${PANEL_ID} .cxah-cal-nav:hover { background: rgba(255,255,255,0.15); }
+      #${PANEL_ID} .cxah-cal-grid {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 2px;
+      }
+      #${PANEL_ID} .cxah-cal-wk {
+        text-align: center;
+        font-size: 10px;
+        color: #9fb6b0;
+        padding: 2px 0;
+        font-weight: 600;
+      }
+      #${PANEL_ID} .cxah-cal-day {
+        text-align: center;
+        padding: 5px 2px;
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+        color: #f3f0e8;
+        transition: background 0.1s;
+      }
+      #${PANEL_ID} .cxah-cal-day:hover:not(.cxah-cal-past):not(.cxah-cal-empty) {
+        background: rgba(255,255,255,0.1);
+      }
+      #${PANEL_ID} .cxah-cal-day.cxah-cal-selected {
+        background: #2a6d68;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .cxah-cal-day.cxah-cal-past {
+        color: #4a5e5a;
+        cursor: default;
+      }
+      #${PANEL_ID} .cxah-cal-day.cxah-cal-empty {
+        cursor: default;
+      }
       #${PANEL_ID} .cxah-debug {
         margin: 0 14px 14px;
         border: 1px solid #2f4946;
@@ -3608,13 +3823,26 @@
             <label for="cxah-destination">Destination</label>
             <input id="cxah-destination" maxlength="40" placeholder="HKG" value="${settings.destination}" />
           </div>
-          <div>
-            <label for="cxah-start-date">Start date</label>
-            <input id="cxah-start-date" type="date" value="${settings.startDate}" />
+          <div style="grid-column: 1 / -1;">
+            <label for="cxah-date-mode">Date selection</label>
+            <select id="cxah-date-mode">
+              <option value="consecutive" ${(settings.dateMode || "consecutive") === "consecutive" ? "selected" : ""}>Consecutive days</option>
+              <option value="specific" ${settings.dateMode === "specific" ? "selected" : ""}>Specific dates</option>
+            </select>
           </div>
-          <div>
-            <label for="cxah-days">Days (max ${MAX_DAYS})</label>
-            <input id="cxah-days" type="number" min="1" max="${MAX_DAYS}" value="${settings.days}" />
+          <div id="cxah-consecutive-wrap" style="grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:8px;${settings.dateMode === "specific" ? "display:none;" : ""}">
+            <div>
+              <label for="cxah-start-date">Start date</label>
+              <input id="cxah-start-date" type="date" value="${settings.startDate}" />
+            </div>
+            <div>
+              <label for="cxah-days">Days (max ${MAX_DAYS})</label>
+              <input id="cxah-days" type="number" min="1" max="${MAX_DAYS}" value="${settings.days}" />
+            </div>
+          </div>
+          <div id="cxah-calendar-wrap" style="grid-column:1/-1;${settings.dateMode === "specific" ? "" : "display:none;"}">
+            <div id="cxah-calendar"></div>
+            <div id="cxah-calendar-count" style="font-size:11px;color:#9fb6b0;margin-top:4px;">0 / ${MAX_DAYS} dates selected</div>
           </div>
           <div>
             <label for="cxah-adults">Adults</label>
@@ -3670,6 +3898,17 @@
     panel.querySelector("#cxah-route-preset").addEventListener("change", applyRoutePreset);
     panel.querySelector("#cxah-swap-route").addEventListener("click", onSwapRoute);
     panel.querySelector("#cxah-collapse").addEventListener("click", toggleCollapse);
+    panel.querySelector("#cxah-date-mode").addEventListener("change", function () {
+      toggleDateModeUI(this.value);
+    });
+    const calendarEl = panel.querySelector("#cxah-calendar");
+    if (calendarEl) {
+      calendarEl.addEventListener("click", onCalendarClick);
+      calendarEl.addEventListener("click", onCalendarNav);
+    }
+    // Initialize calendar state from settings
+    calendarSelectedDates = new Set(Array.isArray(settings.specificDates) ? settings.specificDates : []);
+    renderCalendar();
     makeDraggable(panel, panel.querySelector(".cxah-head"));
     renderResults();
     renderDebugLog();
@@ -3728,13 +3967,13 @@
       }
 
       console.log("[CX Helper] Boot: phase=", run.phase, "isHomepage=", isHomepage(),
-        "isResults=", isResultsPage());
+        "isResults=", isResultsPage(), "url=", window.location.href);
 
       if (run.phase === "go-homepage") {
         // Wait for homepage to fully load after navigation from results page.
         // The "New search" link triggers a full page navigation, so we need to
         // wait for the booking panel to appear.
-        for (let wait = 0; wait < 20; wait++) {
+        for (let wait = 0; wait < 30; wait++) {
           if (await recoverFromErrorPage(run)) {
             return;
           }
@@ -3743,10 +3982,22 @@
             await launchHomepageSearchForRun(run);
             return;
           }
+          if (wait % 5 === 4) {
+            const bodySnippet = (document.body ? document.body.innerText : "").slice(0, 200);
+            console.log("[CX Helper] Homepage check diag: url=", window.location.href,
+              "bodyStart=", JSON.stringify(bodySnippet));
+          }
+          // If we're on the right URL but page hasn't rendered, wait longer
+          // If we're on the wrong URL, try navigating again
+          if (wait === 15 && !/cathaypacific\.com\/cx\/en_US/.test(window.location.href)) {
+            console.log("[CX Helper] Not on homepage URL after 15 attempts, re-navigating");
+            window.location.assign(HOMEPAGE_URL);
+            return;
+          }
           console.log("[CX Helper] Waiting for homepage to load... attempt", wait);
           await sleep(1500);
         }
-        console.log("[CX Helper] Homepage never loaded, stopping");
+        console.log("[CX Helper] Homepage never loaded after 30 attempts, stopping");
         finalizeRun(run, "stopped");
         setStatus("Stopped: Homepage did not load after returning from results.");
         return;
