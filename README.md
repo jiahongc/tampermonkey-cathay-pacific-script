@@ -2,6 +2,8 @@
 
 A Tampermonkey userscript that automates Cathay Pacific award flight searches across a date range.
 
+[Install](#installation) · [Usage](#usage) · [How it works](#how-it-works) · [Requirements](#requirements)
+
 ## Features
 
 - Search for award availability across multiple dates automatically
@@ -77,3 +79,9 @@ For technical details on the website's DOM patterns and interaction methods, see
 
 - Tampermonkey (or compatible userscript manager)
 - A Cathay Pacific account (for award availability)
+
+## Limits and troubleshooting
+
+Availability is a snapshot of what the website returned during the scan. Cathay can change its pages or block a session. Stop after repeated errors and retry later; recovery is not guaranteed. Use the debug version when diagnosing a failed scan, and remove personal information from logs before sharing them.
+
+There is no npm build step: edit the userscript and reload it through your userscript manager. Install only one of the production or debug variants at a time.
